@@ -25,6 +25,7 @@ jsonwebtoken = "10"
 clap = { version = "4.6", features = ["derive", "env"] }
 quick-xml = "0.37"
 secrecy = { workspace = true }
+walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"

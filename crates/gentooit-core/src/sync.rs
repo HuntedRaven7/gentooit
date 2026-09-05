@@ -7,9 +7,11 @@
 //! and maintain the distro packaging (e.g. using `files_to_sync`).
 
 use std::path::Path;
+use std::process::Command;
 
 use crate::config::{ProjectConfig, UpstreamConfig, UserConfig};
 use crate::github::GitHub;
+use crate::repo::Repo;
 
 /// The result of a sync-from-downstream run.
 #[derive(Debug, Clone)]
@@ -190,24 +192,119 @@ fn chrono_ts() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-/// Apply sync changes locally (for offline/dry-run) by copying upstream files
-/// into the downstream repo worktree. This is a helper for the CLI's
-/// `--local` mode; not currently wired into the async path.
+fn git_user(upstream_dir: &Path) -> anyhow::Result<(String, String)> {
+    let name = Command::new("git")
+        .arg("-C")
+        .arg(upstream_dir)
+        .arg("config")
+        .arg("user.name")
+        .output()?;
+    let email = Command::new("git")
+        .arg("-C")
+        .arg(upstream_dir)
+        .arg("config")
+        .arg("user.email")
+        .output()?;
+    let name = if name.status.success() {
+        String::from_utf8_lossy(&name.stdout).trim().to_string()
+    } else {
+        String::new()
+    };
+    let email = if email.status.success() {
+        String::from_utf8_lossy(&email.stdout).trim().to_string()
+    } else {
+        String::new()
+    };
+    if name.is_empty() && email.is_empty() {
+        anyhow::bail!("no git user configured");
+    }
+    Ok((name, email))
+}
+
+/// Apply sync changes locally by copying files from the downstream worktree
+/// into the upstream worktree and creating a single commit.
 pub fn sync_local(
     project: &ProjectConfig,
     upstream_dir: &Path,
-    _downstream_dir: &Path,
+    downstream_dir: &Path,
 ) -> anyhow::Result<Vec<String>> {
-    let files = match project.files_to_sync.is_empty() {
-        true => vec![],
-        false => project
-            .files_to_sync
-            .iter()
-            .map(|f| f.src.clone())
-            .collect(),
+    let repo = Repo::open(upstream_dir)?;
+    let mut synced = Vec::new();
+
+    if project.files_to_sync.is_empty() {
+        // Default: sync the ebuild files that gentooit manages, if present.
+        for candidate in [
+            "metadata.xml",
+            "Manifest",
+            "gentooit.yaml",
+            ".gentooit.yaml",
+        ] {
+            let src = downstream_dir.join(candidate);
+            if src.is_file() {
+                let dest = upstream_dir.join(candidate);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&src, &dest)?;
+                repo.add_path(candidate, false)?;
+                synced.push(candidate.to_string());
+            }
+        }
+        // Also match any *.ebuild in the downstream subtree, preserving
+        // relative paths.
+        for entry in walkdir::WalkDir::new(downstream_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file()
+                && path.extension().map(|e| e == "ebuild").unwrap_or(false)
+                && !path.starts_with(downstream_dir.join(".git"))
+            {
+                let rel = path.strip_prefix(downstream_dir).map_err(|_| {
+                    anyhow::anyhow!("path outside downstream dir: {}", path.display())
+                })?;
+                let dest = upstream_dir.join(rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(path, &dest)?;
+                repo.add_path(&rel.to_string_lossy(), false)?;
+                synced.push(rel.to_string_lossy().to_string());
+            }
+        }
+    } else {
+        for fs in &project.files_to_sync {
+            let src_path = downstream_dir.join(&fs.src);
+            if !src_path.is_file() {
+                continue;
+            }
+            let dest_path = upstream_dir.join(&fs.dest);
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&src_path, &dest_path)?;
+            repo.add_path(&fs.dest, false)?;
+            synced.push(fs.dest.clone());
+        }
+    }
+
+    if synced.is_empty() {
+        return Ok(synced);
+    }
+
+    let (author_name, author_email) = match git_user(upstream_dir) {
+        Ok((name, email)) => (name, email),
+        Err(_) => ("gentooit".to_string(), "gentooit@localhost".to_string()),
     };
-    let _ = upstream_dir;
-    Ok(files)
+
+    repo.commit(
+        &author_name,
+        &author_email,
+        "gentooit: sync packaging files from downstream",
+    )?;
+
+    Ok(synced)
 }
 
 #[cfg(test)]

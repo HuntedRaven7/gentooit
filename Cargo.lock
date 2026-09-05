@@ -823,6 +823,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "walkdir",
  "whirlpool",
  "yaml_serde",
 ]
