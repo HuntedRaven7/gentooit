@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::config::{DownstreamConfig, ProjectConfig, UpstreamConfig, UserConfig};
 use crate::ebuild::{Atom, EbuildMetadata, PackageName};
-use crate::github::GitHub;
+use crate::github::{GitHub, Release, ReleaseAsset};
 use crate::manifest::{HashAlgo, Manifest, ManifestEntry, ManifestEntryType};
 use crate::metadata::PackageMetadata;
 use crate::repo::Repo;
@@ -56,6 +56,22 @@ pub struct ProposeResult {
     pub commit_message: String,
 }
 
+/// A resolved source archive for a release: where to download it, the
+/// parameterized `SRC_URI` for the ebuild, and an optional `S` override for
+/// archives whose extracted directory doesn't match `${P}`.
+#[derive(Debug, Clone)]
+pub struct SourceArchive {
+    /// Literal URL to download the archive right now.
+    pub download_url: String,
+    /// `SRC_URI` value with `${PV}`/`${P}` substituted where safe.
+    pub src_uri: String,
+    /// The distfile basename (used for `Manifest` and local download).
+    pub filename: String,
+    /// Extracted source directory, as an ebuild `S` value
+    /// (`${WORKDIR}/...`), when it differs from ${P}.
+    pub extract_dir: Option<String>,
+}
+
 /// High-level entry point for `gentooit propose-downstream`.
 pub async fn propose_downstream(
     project: &ProjectConfig,
@@ -75,7 +91,8 @@ pub async fn propose_downstream(
         None => GitHub::anonymous()?,
     };
 
-    // 1. Discover the release.
+    // 1. Discover the release. Keep the release object (with its assets) so we
+    //    can pick a source archive from attached release assets.
     let (owner, repo_name) = split_upstream(upstream).ok_or_else(|| {
         anyhow::anyhow!(
             "invalid upstream `{:?}`: expected owner/name",
@@ -83,10 +100,13 @@ pub async fn propose_downstream(
         )
     })?;
 
-    let version = match &upstream.version {
-        Some(v) => v.clone(),
+    let (version, release) = match &upstream.version {
+        Some(v) => (
+            v.clone(),
+            find_release(&github, upstream, owner, repo_name, v).await?,
+        ),
         None => match github.latest_release(owner, repo_name).await? {
-            Some(rel) => version_from_tag(&rel.tag_name, upstream),
+            Some(rel) => (version_from_tag(&rel.tag_name, upstream), Some(rel)),
             None => anyhow::bail!(
                 "no releases found for {owner}/{repo_name}; set an explicit `version` in the config"
             ),
@@ -100,48 +120,56 @@ pub async fn propose_downstream(
         None => repo_name.to_string(),
     };
 
-    // 3. Determine the source archive. Prefer an attached release asset named
-    //    after the tag; fall back to the GitHub tarball of the tag.
-    let archive_url = build_archive_url(upstream, owner, repo_name, &version);
-    let tarball_name = archive_name(upstream, &package_name, &version);
+    // 3. Determine the source archive. Prefer an attached release asset (e.g.
+    //    a tarball that doesn't match `${P}`), falling back to the GitHub
+    //    source tarball of the tag.
+    let archive = resolve_source_archive(
+        upstream,
+        release.as_ref(),
+        owner,
+        repo_name,
+        &package_name,
+        &version,
+    );
 
     // Download the source archive into a working directory.
     let distdir = workdir.join("distfiles");
-    let archive_path = distdir.join(&tarball_name);
-    tracing::debug!(url = %archive_url, dest = %archive_path.display(), "downloading source archive");
-    github.download(&archive_url, &archive_path).await?;
+    let archive_path = distdir.join(&archive.filename);
+    tracing::debug!(
+        url = %archive.download_url,
+        dest = %archive_path.display(),
+        "downloading source archive"
+    );
+    github
+        .download(&archive.download_url, &archive_path)
+        .await?;
 
     // 4. Compose ebuild content and Manifest.
     let atom = Atom::new(&derive_category(project, upstream)?, &package_name)?;
 
-    let srcurl = upstream_archive_src_uri(upstream, owner, repo_name, &package_name);
     let ebuild_content = render_ebuild(
         atom.package.clone(),
         &version,
         project,
         &package_name,
-        &srcurl,
+        &archive.src_uri,
+        archive.extract_dir.as_deref(),
     );
     let ebuild_filename = format!("{package_name}-{version}.ebuild");
 
     let manifest_entry = ManifestEntry {
         entry_type: ManifestEntryType::Dist,
-        filename: tarball_name.clone(),
+        filename: archive.filename.clone(),
         size: std::fs::metadata(&archive_path)?.len(),
         hashes: hash_archive(&archive_path),
     };
     let mut manifest = Manifest::default();
-    manifest.upsert(manifest_entry);
+    manifest.upsert(manifest_entry.clone());
     // Include existing dist entries if an existing Manifest is being updated.
     if !options.force {
         if let Some(existing) = load_existing_manifest(workdir, &atom, &ebuild_filename)? {
             manifest = existing;
-            manifest.upsert(ManifestEntry {
-                entry_type: ManifestEntryType::Dist,
-                filename: tarball_name.clone(),
-                size: std::fs::metadata(&archive_path)?.len(),
-                hashes: hash_archive(&archive_path),
-            });
+            manifest.upsert(manifest_entry);
         }
     }
     if options.no_qa {
@@ -228,50 +256,321 @@ fn strip_template(tag: &str, tmpl: &str) -> String {
     out.to_string()
 }
 
-/// Build the URL to download for the release archive.
-fn build_archive_url(upstream: &UpstreamConfig, owner: &str, repo: &str, version: &str) -> String {
-    if let Some(template) = &upstream.archive_template {
-        // User-provided full URL template.
-        let url = template
-            .replace("{version}", version)
-            .replace("{vsn}", version);
-        return url;
-    }
-    // Default: GitHub source tar.gz of the tag.
-    let tag = upstream
+/// The git tag that corresponds to `version`.
+fn tag_for_version(upstream: &UpstreamConfig, version: &str) -> String {
+    upstream
         .tag_template
         .as_ref()
-        .map(|t| t.replace("{version}", version))
-        .unwrap_or_else(|| format!("v{version}"));
-    format!("https://github.com/{owner}/{repo}/archive/refs/tags/{tag}.tar.gz")
+        .map(|t| t.replace("{version}", version).replace("{vsn}", version))
+        .unwrap_or_else(|| version.to_string())
 }
 
-/// The basename (distfile name) for the archive.
-fn archive_name(upstream: &UpstreamConfig, package: &str, version: &str) -> String {
-    upstream
-        .archive_name_override()
-        .map(|n| {
-            n.replace("{version}", version)
-                .replace("{package}", package)
-        })
-        .unwrap_or_else(|| format!("{package}-{version}.tar.gz"))
+/// Candidate tag names to look up a release for `version` (tries the tag
+/// template first, then the bare version and common prefixes).
+fn candidate_tags(upstream: &UpstreamConfig, version: &str) -> Vec<String> {
+    let mut tags = vec![tag_for_version(upstream, version), version.to_string()];
+    if !version.starts_with('v') {
+        tags.push(format!("v{version}"));
+    }
+    if !version.starts_with("release-") {
+        tags.push(format!("release-{version}"));
+    }
+    tags.dedup();
+    tags
 }
 
-/// Build the template for `SRC_URI` in the ebuild.
-fn upstream_archive_src_uri(
+/// Fetch the release for `version` (by trying candidate tags), if one exists.
+async fn find_release(
+    github: &GitHub,
     upstream: &UpstreamConfig,
     owner: &str,
-    repo: &str,
-    _package: &str,
-) -> String {
-    match &upstream.archive_template {
-        Some(template) => template
-            .replace("{version}", "${PV}")
-            .replace("{package}", "${PN}"),
-        None => {
-            format!("https://github.com/{owner}/{repo}/releases/download/${{PV}}/${{P}}.tar.gz")
+    repo_name: &str,
+    version: &str,
+) -> anyhow::Result<Option<Release>> {
+    for tag in candidate_tags(upstream, version) {
+        match github.release_by_tag(owner, repo_name, &tag).await {
+            Ok(rel) => return Ok(Some(rel)),
+            Err(_) => continue,
         }
     }
+    Ok(None)
+}
+
+/// Resolve which archive to use for the release: the user's explicit URL
+/// template, a best-matching release asset, or the GitHub source tarball of
+/// the tag.
+fn resolve_source_archive(
+    upstream: &UpstreamConfig,
+    release: Option<&Release>,
+    owner: &str,
+    repo_name: &str,
+    package: &str,
+    version: &str,
+) -> SourceArchive {
+    let tag = tag_for_version(upstream, version);
+
+    // 1. An explicit full URL template wins over everything.
+    if let Some(template) = &upstream.archive_template {
+        let url = template
+            .replace("{version}", version)
+            .replace("{vsn}", version)
+            .replace("{tag}", &tag);
+        let filename = upstream
+            .archive_name_override()
+            .map(|n| substitute_name(&n, package, version))
+            .unwrap_or_else(|| url_basename(&url));
+        return SourceArchive {
+            download_url: url.clone(),
+            src_uri: parameterize_url(&url, package, version, &tag),
+            filename: filename.clone(),
+            extract_dir: derive_extract_dir(
+                upstream,
+                package,
+                version,
+                &filename,
+                &url,
+                Some(repo_name),
+                &tag,
+            ),
+        };
+    }
+
+    // 2. Pick the best release asset (an `archive-name` override narrows the
+    //    search to that exact name).
+    if let Some(rel) = release {
+        if let Some(asset) = pick_asset(
+            &rel.assets,
+            package,
+            version,
+            upstream.archive_name_override().as_deref(),
+        ) {
+            tracing::debug!(asset = %asset.name, "using release asset as source archive");
+            return SourceArchive {
+                download_url: asset.browser_download_url.clone(),
+                src_uri: parameterize_url(&asset.browser_download_url, package, version, &tag),
+                filename: asset.name.clone(),
+                extract_dir: derive_extract_dir(
+                    upstream,
+                    package,
+                    version,
+                    &asset.name,
+                    &asset.browser_download_url,
+                    Some(repo_name),
+                    &tag,
+                ),
+            };
+        }
+    }
+
+    // 3. Fall back to the GitHub source tarball of the tag.
+    let fallback_url =
+        format!("https://github.com/{owner}/{repo_name}/archive/refs/tags/{tag}.tar.gz");
+    let filename = upstream
+        .archive_name_override()
+        .map(|n| substitute_name(&n, package, version))
+        .unwrap_or_else(|| format!("{package}-{version}.tar.gz"));
+    SourceArchive {
+        download_url: fallback_url.clone(),
+        src_uri: parameterize_url(&fallback_url, package, version, &tag),
+        filename: filename.clone(),
+        extract_dir: derive_extract_dir(
+            upstream,
+            package,
+            version,
+            &filename,
+            &fallback_url,
+            Some(repo_name),
+            &tag,
+        ),
+    }
+}
+
+/// Choose the best source archive asset from a release's assets. Returns None
+/// when no asset looks like a source tarball.
+fn pick_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    package: &str,
+    version: &str,
+    name_override: Option<&str>,
+) -> Option<&'a ReleaseAsset> {
+    let candidates: Vec<&ReleaseAsset> = assets
+        .iter()
+        .filter(|a| !is_checksum_or_meta(&a.name))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(over) = name_override {
+        let target = substitute_name(over, package, version);
+        if let Some(a) = candidates.iter().find(|a| a.name == target) {
+            return Some(a);
+        }
+    }
+    candidates
+        .iter()
+        .max_by_key(|a| score_asset(&a.name, package, version))
+        .copied()
+        .filter(|a| score_asset(&a.name, package, version) > 0)
+}
+
+/// Score how likely an asset is the source tarball. Highest wins.
+fn score_asset(name: &str, package: &str, version: &str) -> i32 {
+    let n = name.to_ascii_lowercase();
+    let exact = format!("{package}-{version}.tar.gz");
+    if n == exact {
+        return 100;
+    }
+    if !looks_like_source(name) || has_platform_marker(&n) {
+        return 0;
+    }
+    if n.starts_with("source") || n.starts_with("src-") || n.starts_with("src_") {
+        return 70;
+    }
+    let mut score = 25;
+    let has_version = n.contains(&version.to_ascii_lowercase());
+    let has_package = n.contains(&package.to_ascii_lowercase());
+    if has_version {
+        score += 20;
+    }
+    if has_package {
+        score += 15;
+    }
+    score
+}
+
+/// Compiled binaries are nearly always named with a platform/target triplet;
+/// such names can't be a source archive.
+fn has_platform_marker(name: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "windows", "win32", "win64", "msvc", "mingw", "cygwin", "macos", "darwin", "apple",
+        "linux", "musl", "gnu-", "gnu_", "x86_64", "x86-64", "amd64", "i686", "i386", "arm64",
+        "aarch64", "armv7", "armhf", "ppc64", "powerpc", "s390x", "riscv", "mips", "android",
+        "ios", "freebsd", "openbsd", "netbsd", ".exe", ".msi", ".dmg", ".apk", ".deb", ".rpm",
+    ];
+    MARKERS.iter().any(|m| name.contains(m))
+}
+
+/// Whether a filename looks like a source archive (as opposed to a binary
+/// artifact, installer, or checksum).
+fn looks_like_source(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    (n.ends_with(".tar.gz")
+        || n.ends_with(".tgz")
+        || n.ends_with(".tar.xz")
+        || n.ends_with(".tar.bz2")
+        || n.ends_with(".tar.zst")
+        || n.ends_with(".tar.lz")
+        || n.ends_with(".tar")
+        || n.ends_with(".zip"))
+        && !(n.contains("windows")
+            || n.contains(".exe")
+            || n.contains(".msi")
+            || n.contains(".dmg")
+            || n.contains("macos")
+            || n.contains(".deb")
+            || n.contains(".rpm")
+            || n.contains(".apk"))
+}
+
+/// Checksums, signatures, and metadata files aren't source archives.
+fn is_checksum_or_meta(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.ends_with(".sha256")
+        || n.ends_with(".sha512")
+        || n.ends_with(".sha1")
+        || n.ends_with(".asc")
+        || n.ends_with(".sig")
+        || n.ends_with(".md")
+        || n.ends_with(".txt")
+        || n.ends_with(".json")
+        || n.ends_with(".sums")
+}
+
+/// The the directory an archive extracts to (best effort): the basename minus
+/// its archive extension(s).
+fn archive_stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    for ext in [
+        ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tar.lz", ".tar", ".tgz", ".zip",
+    ] {
+        if lower.ends_with(ext) {
+            return name[..name.len() - ext.len()].to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// GitHub source tarballs (auto-generated) extract to `{repo}-{tag}`.
+fn github_archive_extract_dir(repo_name: &str, tag: &str, url: &str) -> Option<String> {
+    if url.contains(&format!("/archive/refs/tags/{tag}"))
+        || url.contains(&format!("/archive/{tag}"))
+    {
+        Some(format!("{repo_name}-{tag}"))
+    } else {
+        None
+    }
+}
+
+/// Determine the ebuild `S` override value, or None when the extracted
+/// directory matches `${P}`. An explicit `s-dir` config wins.
+fn derive_extract_dir(
+    upstream: &UpstreamConfig,
+    package: &str,
+    version: &str,
+    filename: &str,
+    url: &str,
+    repo_name: Option<&str>,
+    tag: &str,
+) -> Option<String> {
+    if let Some(s) = &upstream.s_dir {
+        return s_override_value(package, version, &substitute_name(s, package, version));
+    }
+    let dir = if let Some(repo) = repo_name {
+        github_archive_extract_dir(repo, tag, url).unwrap_or_else(|| archive_stem(filename))
+    } else {
+        archive_stem(filename)
+    };
+    s_override_value(package, version, &dir)
+}
+
+/// Build the `S` value (`${WORKDIR}/...`), or None if `dir` equals `${P}`.
+fn s_override_value(package: &str, version: &str, dir: &str) -> Option<String> {
+    if dir == format!("{package}-{version}") {
+        None
+    } else {
+        Some(format!(
+            "${{WORKDIR}}/{}",
+            parameterized_name_component(dir, package, version)
+        ))
+    }
+}
+
+/// Substitute `${PV}` (and `${P}` for a literal `{package}-{version}` run) into
+/// a URL or directory name so the ebuild stays correct across bumps. Replacing
+/// the version itself (rather than the tag string) keeps tag prefixes like `v`
+/// intact: `refs/tags/v1.2.3.tar.gz` -> `refs/tags/v${PV}.tar.gz`.
+fn parameterize_url(url: &str, package: &str, version: &str, _tag: &str) -> String {
+    let mut s = url.replace(&format!("{package}-{version}"), "${P}");
+    s = s.replace(version, "${PV}");
+    s
+}
+
+/// Version/package parameterization for a bare name/path component.
+fn parameterized_name_component(value: &str, package: &str, version: &str) -> String {
+    value
+        .replace(&format!("{package}-{version}"), "${P}")
+        .replace(version, "${PV}")
+}
+
+/// Replace `{version}`/`{package}` templates with concrete values.
+fn substitute_name(name: &str, package: &str, version: &str) -> String {
+    name.replace("{version}", version)
+        .replace("{package}", package)
+}
+
+/// The last path segment of a URL.
+fn url_basename(url: &str) -> String {
+    url.rsplit('/').next().unwrap_or(url).to_string()
 }
 
 /// Hash the archive with the current Gentoo policy (SHA256 + SHA512).
@@ -297,6 +596,7 @@ fn render_ebuild(
     project: &ProjectConfig,
     _package_name: &str,
     srcurl: &str,
+    s_override: Option<&str>,
 ) -> String {
     let p = project.package.as_ref();
     let meta = EbuildMetadata {
@@ -319,7 +619,7 @@ fn render_ebuild(
         depend: p.and_then(|x| x.depend.clone()),
         rdepend: p.and_then(|x| x.rdepend.clone()),
         bdepend: p.and_then(|x| x.bdepend.clone()),
-        s: None,
+        s: s_override.map(|s| s.to_string()),
     };
 
     let mut out = String::new();
@@ -344,6 +644,9 @@ fn render_ebuild(
     }
     if let Some(k) = &meta.keywords {
         push_var(&mut out, "KEYWORDS", k);
+    }
+    if let Some(s) = &meta.s {
+        push_var(&mut out, "S", s);
     }
     if let Some(i) = &meta.iuse {
         push_var(&mut out, "IUSE", i);
@@ -659,11 +962,195 @@ mod tests {
             &project,
             "foo",
             "https://github.com/foo/foo/releases/download/${PV}/${P}.tar.gz",
+            None,
         );
         assert!(content.contains("EAPI=8"));
         assert!(content.contains("DESCRIPTION="));
         assert!(content.contains("SRC_URI="));
         assert!(content.contains("KEYWORDS="));
+        assert!(
+            !content.lines().any(|l| l.starts_with("S=")),
+            "no S override expected"
+        );
+    }
+
+    #[test]
+    fn render_ebuild_s_override() {
+        let project = ProjectConfig::default();
+        let content = render_ebuild(
+            PackageName::new("foo").unwrap(),
+            "1.0.0",
+            &project,
+            "foo",
+            "https://example.com/download/deps-${PV}.tar.gz",
+            Some("${WORKDIR}/deps-${PV}"),
+        );
+        assert!(content.contains("S=\"${WORKDIR}/deps-${PV}\""));
+    }
+
+    #[test]
+    fn archive_matching_p_has_no_s_override() {
+        assert_eq!(
+            s_override_value("foo", "1.2.3", "foo-1.2.3").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn archive_not_matching_p_needs_s_override() {
+        assert_eq!(
+            s_override_value("foo", "1.2.3", "foo-v1.2.3-extra").as_deref(),
+            Some("${WORKDIR}/foo-v${PV}-extra")
+        );
+    }
+
+    #[test]
+    fn github_tarball_extract_dir() {
+        assert_eq!(
+            github_archive_extract_dir(
+                "ripgrep",
+                "v15.2.0",
+                "https://github.com/BurntSushi/ripgrep/archive/refs/tags/v15.2.0.tar.gz"
+            )
+            .as_deref(),
+            Some("ripgrep-v15.2.0")
+        );
+    }
+
+    #[test]
+    fn pick_asset_prefers_exact_match() {
+        let assets = [
+            ReleaseAsset {
+                name: "grep".to_string(),
+                browser_download_url: "https://example.com/grep".to_string(),
+            },
+            ReleaseAsset {
+                name: "foo-1.2.3.tar.gz".to_string(),
+                browser_download_url: "https://example.com/foo-1.2.3.tar.gz".to_string(),
+            },
+            ReleaseAsset {
+                name: "foo-1.2.3-x86_64-linux.tar.gz".to_string(),
+                browser_download_url: "https://example.com/alt.tar.gz".to_string(),
+            },
+        ];
+        let chosen = pick_asset(&assets, "foo", "1.2.3", None).unwrap();
+        assert_eq!(chosen.name, "foo-1.2.3.tar.gz");
+    }
+
+    #[test]
+    fn pick_asset_falls_back_to_best_non_exact() {
+        let assets = [
+            ReleaseAsset {
+                name: "foo-1.2.3.zip".to_string(),
+                browser_download_url: "https://example.com/a.zip".to_string(),
+            },
+            ReleaseAsset {
+                name: "checksums.txt".to_string(),
+                browser_download_url: "https://example.com/c.txt".to_string(),
+            },
+            ReleaseAsset {
+                name: "foo-1.2.3-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                browser_download_url: "https://example.com/bin.tar.gz".to_string(),
+            },
+            ReleaseAsset {
+                name: "source.tar.gz".to_string(),
+                browser_download_url: "https://example.com/source.tar.gz".to_string(),
+            },
+        ];
+        let chosen = pick_asset(&assets, "foo", "1.2.3", None).unwrap();
+        assert_eq!(chosen.name, "source.tar.gz");
+    }
+
+    #[test]
+    fn pick_asset_never_selects_binary() {
+        let assets = vec![ReleaseAsset {
+            name: "foo-1.2.3-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+            browser_download_url: "https://example.com/bin.tar.gz".to_string(),
+        }];
+        assert!(pick_asset(&assets, "foo", "1.2.3", None).is_none());
+    }
+
+    #[test]
+    fn resolve_prefers_asset_over_tarball() {
+        let upstream = UpstreamConfig {
+            tag_template: Some("{version}".to_string()),
+            ..Default::default()
+        };
+        let release = Release {
+            tag_name: "1.2.3".to_string(),
+            name: Some("1.2.3".to_string()),
+            body: None,
+            assets: vec![ReleaseAsset {
+                name: "foo-1.2.3-src.tar.gz".to_string(),
+                browser_download_url:
+                    "https://github.com/o/r/releases/download/1.2.3/foo-1.2.3-src.tar.gz"
+                        .to_string(),
+            }],
+            tarball_url: Some("https://github.com/o/r/archive/refs/tags/1.2.3.tar.gz".to_string()),
+        };
+        let arch = resolve_source_archive(&upstream, Some(&release), "o", "r", "foo", "1.2.3");
+        assert_eq!(arch.filename, "foo-1.2.3-src.tar.gz");
+        assert_eq!(
+            arch.src_uri,
+            "https://github.com/o/r/releases/download/${PV}/${P}-src.tar.gz"
+        );
+        assert_eq!(arch.extract_dir.as_deref(), Some("${WORKDIR}/${P}-src"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_github_tarball() {
+        let upstream = UpstreamConfig {
+            tag_template: Some("v{version}".to_string()),
+            ..Default::default()
+        };
+        let arch = resolve_source_archive(&upstream, None, "o", "foo", "foo", "1.2.3");
+        assert_eq!(
+            arch.download_url,
+            "https://github.com/o/foo/archive/refs/tags/v1.2.3.tar.gz"
+        );
+        assert_eq!(arch.filename, "foo-1.2.3.tar.gz");
+        assert_eq!(
+            arch.src_uri,
+            "https://github.com/o/foo/archive/refs/tags/v${PV}.tar.gz"
+        );
+        assert_eq!(arch.extract_dir.as_deref(), Some("${WORKDIR}/foo-v${PV}"));
+    }
+
+    #[test]
+    fn resolve_p_style_asset_needs_no_s() {
+        let upstream = UpstreamConfig::default();
+        let release = Release {
+            tag_name: "1.2.3".to_string(),
+            name: None,
+            body: None,
+            assets: vec![ReleaseAsset {
+                name: "foo-1.2.3.tar.gz".to_string(),
+                browser_download_url:
+                    "https://github.com/o/r/releases/download/1.2.3/foo-1.2.3.tar.gz".to_string(),
+            }],
+            tarball_url: None,
+        };
+        let arch = resolve_source_archive(&upstream, Some(&release), "o", "r", "foo", "1.2.3");
+        assert_eq!(arch.filename, "foo-1.2.3.tar.gz");
+        assert_eq!(
+            arch.src_uri,
+            "https://github.com/o/r/releases/download/${PV}/${P}.tar.gz"
+        );
+        assert_eq!(arch.extract_dir, None);
+    }
+
+    #[test]
+    fn metadata_uses_remote_id_type_override() {
+        let project = ProjectConfig {
+            package: Some(crate::config::PackageConfig {
+                remote_id_type: Some("crates-io".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let user = UserConfig::default();
+        let md = render_metadata(&project, &user, &UpstreamConfig::default(), "alice", "foo");
+        assert!(md.contains("<remote-id type=\"crates-io\">alice/foo</remote-id>"));
     }
 
     #[test]

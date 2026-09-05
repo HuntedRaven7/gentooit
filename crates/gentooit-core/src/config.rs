@@ -131,6 +131,12 @@ pub struct UpstreamConfig {
     /// The version to propose. If unset, the latest release is used.
     #[serde(default)]
     pub version: Option<String>,
+    /// Override for the extracted source directory when it differs from
+    /// `${P}` (for archives whose top-level directory doesn't match the ebuild
+    /// basename). May contain `{version}`/`{package}` templates. If unset,
+    /// gentooit derives it from the chosen archive's name / GitHub tarball.
+    #[serde(default)]
+    pub s_dir: Option<String>,
 }
 
 impl UpstreamConfig {

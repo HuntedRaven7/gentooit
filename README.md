@@ -153,7 +153,7 @@ Key design choices:
 
 ## Roadmap
 
-- [ ] Use GitHub release **assets** and `S` override detection (derive archive
+- [x] Use GitHub release **assets** and `S` override detection (derive archive
   filenames that don't match `${P}`)
 - [ ] Ebuild "diff-bump" of an existing ebuild (preserve custom `src_*`
   functions) instead of always generating fresh
