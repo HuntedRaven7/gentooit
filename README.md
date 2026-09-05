@@ -276,6 +276,17 @@ Key design choices:
 - [x] `sync-from-downstream` local mode that copies files into the upstream
   worktree and commits
 
+## Security
+
+We run `cargo audit` in CI and address high/critical vulnerabilities
+promptly. One advisory is currently accepted as a known risk:
+
+- **RUSTSEC-2023-0071** (`rsa` 0.9.10, medium) — Marvin Attack timing
+  sidechannel. This is a transitive dependency through `jsonwebtoken` 10
+  (used by `octocrab` for GitHub App JWT signing). The `rsa` crate maintainers
+  have not yet published a patched release. We monitor this dependency and will
+  upgrade as soon as a fix is available.
+
 ## Maintenance
 
 - **CI** (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, and `cargo audit` (RUSTSEC).
