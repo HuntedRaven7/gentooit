@@ -142,7 +142,7 @@ impl PackageMetadata {
                     }
                 }
                 Ok(Event::Text(t)) => {
-                    let text = t.unescape().unwrap_or_default().to_string();
+                    let text = String::from_utf8_lossy(&t).to_string();
                     match current.as_deref() {
                         Some("email") => {
                             if let Some(m) = pkg.maintainers.last_mut() {

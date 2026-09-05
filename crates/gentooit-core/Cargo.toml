@@ -23,7 +23,7 @@ git2 = "0.21"
 octocrab = "0.54"
 jsonwebtoken = "10"
 clap = { version = "4.6", features = ["derive", "env"] }
-quick-xml = "0.37"
+quick-xml = "0.41"
 secrecy = { workspace = true }
 walkdir = "2"
 
