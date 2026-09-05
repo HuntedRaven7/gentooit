@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 use std::path::Path;
+use std::process::Command;
 
 use crate::build::{pkgcheck_scan, pkgdev_manifest, BuildError};
 use crate::config::{DownstreamConfig, ProjectConfig, UpstreamConfig, UserConfig};
@@ -184,6 +185,9 @@ pub async fn propose_downstream(
     // 4. Compose ebuild content and Manifest.
     let atom = Atom::new(&derive_category(project, upstream)?, &package_name)?;
 
+    let is_cargo = detect_cargo(&archive_path)?;
+    tracing::debug!(is_cargo, "detected project type");
+
     let ebuild_content = render_ebuild(
         atom.package.clone(),
         &version,
@@ -191,6 +195,7 @@ pub async fn propose_downstream(
         &package_name,
         &archive.src_uri,
         archive.extract_dir.as_deref(),
+        is_cargo,
     );
     let ebuild_filename = format!("{package_name}-{version}.ebuild");
 
@@ -612,6 +617,18 @@ fn url_basename(url: &str) -> String {
     url.rsplit('/').next().unwrap_or(url).to_string()
 }
 
+/// Detect whether the source archive contains a Rust `Cargo.toml`.
+fn detect_cargo(archive_path: &Path) -> anyhow::Result<bool> {
+    let output = Command::new("tar").arg("-tzf").arg(archive_path).output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    Ok(listing
+        .lines()
+        .any(|line| line.ends_with("/Cargo.toml") || line == "Cargo.toml"))
+}
+
 /// Hash the archive with the current Gentoo policy (SHA256 + SHA512).
 fn hash_archive(path: &Path) -> Vec<(HashAlgo, String)> {
     let data = std::fs::read(path).expect("archive readable");
@@ -636,6 +653,7 @@ fn render_ebuild(
     _package_name: &str,
     srcurl: &str,
     s_override: Option<&str>,
+    is_cargo: bool,
 ) -> String {
     let p = project.package.as_ref();
     let meta = EbuildMetadata {
@@ -665,6 +683,9 @@ fn render_ebuild(
     out.push_str("# Copyright 1999-2026 Gentoo Authors\n");
     out.push_str("# Distributed under the terms of the GNU General Public License v2\n\n");
     out.push_str(&format!("EAPI={}\n\n", meta.eapi.as_deref().unwrap_or("8")));
+    if is_cargo {
+        out.push_str("inherit cargo\n\n");
+    }
     if let Some(d) = &meta.description {
         push_var(&mut out, "DESCRIPTION", d);
     }
@@ -691,8 +712,12 @@ fn render_ebuild(
         push_var(&mut out, "IUSE", i);
     }
     out.push('\n');
-    if let Some(d) = &meta.depend {
-        push_var(&mut out, "DEPEND", d);
+    if is_cargo && meta.depend.is_none() {
+        out.push_str("DEPEND=\"dev-lang/rust:=\"\n\n");
+    } else {
+        if let Some(d) = &meta.depend {
+            push_var(&mut out, "DEPEND", d);
+        }
     }
     if let Some(r) = &meta.rdepend {
         push_var(&mut out, "RDEPEND", r);
@@ -701,7 +726,9 @@ fn render_ebuild(
         push_var(&mut out, "BDEPEND", b);
     }
     out.push('\n');
-    out.push_str("src_install() {\n\tdefault\n}\n");
+    if !is_cargo {
+        out.push_str("src_install() {\n\tdefault\n}\n");
+    }
     // Keep the version referenced so it's used in the signature even if the
     // caller passes an empty version (avoids dead-code warnings in tests).
     let _ = version;
@@ -1230,6 +1257,7 @@ mod tests {
             "foo",
             "https://github.com/foo/foo/releases/download/${PV}/${P}.tar.gz",
             None,
+            false,
         );
         assert!(content.contains("EAPI=8"));
         assert!(content.contains("DESCRIPTION="));
@@ -1238,6 +1266,10 @@ mod tests {
         assert!(
             !content.lines().any(|l| l.starts_with("S=")),
             "no S override expected"
+        );
+        assert!(
+            content.contains("src_install() {"),
+            "non-cargo ebuild should have src_install"
         );
     }
 
@@ -1251,8 +1283,35 @@ mod tests {
             "foo",
             "https://example.com/download/deps-${PV}.tar.gz",
             Some("${WORKDIR}/deps-${PV}"),
+            false,
         );
         assert!(content.contains("S=\"${WORKDIR}/deps-${PV}\""));
+    }
+
+    #[test]
+    fn render_ebuild_cargo_eclass() {
+        let project = ProjectConfig::default();
+        let content = render_ebuild(
+            PackageName::new("ripgrep").unwrap(),
+            "15.2.0",
+            &project,
+            "ripgrep",
+            "https://github.com/BurntSushi/ripgrep/releases/download/${PV}/${P}.tar.gz",
+            None,
+            true,
+        );
+        assert!(
+            content.contains("inherit cargo"),
+            "cargo ebuild should inherit cargo"
+        );
+        assert!(
+            content.contains("DEPEND=\"dev-lang/rust:=\""),
+            "cargo ebuild should depend on rust"
+        );
+        assert!(
+            !content.lines().any(|l| l.starts_with("src_install")),
+            "cargo ebuild should not have custom src_install"
+        );
     }
 
     #[test]
@@ -1475,6 +1534,7 @@ src_install() {
             "foo",
             "https://example.com/download/${PV}/foo-${PV}.tar.gz",
             None,
+            false,
         );
         let merged = render_diff_bump(old, &fresh);
 
@@ -1520,6 +1580,7 @@ src_compile() {
             "foo",
             "https://example.com/${PV}/source.tar.gz",
             Some("${WORKDIR}/source"),
+            false,
         );
         let merged = render_diff_bump(old, &fresh);
 
