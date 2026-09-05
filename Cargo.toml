@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gentooit",
+    "crates/gentooit-core",
+    "crates/gentooit-service",
+]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = { package = "yaml_serde", version = "0.10" }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait = "0.1"
+reqwest = { version = "0.13", features = ["rustls", "json", "stream"] }
+sha2 = "0.11"
+whirlpool = "0.11"
+hex = "0.4"
+url = "2"
+base64 = "0.22"
+
+[profile.release]
+lto = true
+codegen-units = 1

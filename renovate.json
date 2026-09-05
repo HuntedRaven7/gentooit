@@ -1,0 +1,25 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "rangeStrategy": "bump",
+  "packageRules": [
+    {
+      "description": "jsonwebtoken's major must track what octocrab depends on; bump them together.",
+      "matchPackageNames": ["octocrab", "jsonwebtoken"],
+      "groupName": "GitHub client (octocrab + jsonwebtoken)",
+      "groupSlug": "github-client"
+    },
+    {
+      "description": "The service pins sha2 0.10 to match hmac 0.12's digest; bump them as a pair.",
+      "matchPackageNames": ["hmac", "sha2"],
+      "groupName": "HMAC/digest pair",
+      "groupSlug": "hmac-sha2"
+    },
+    {
+      "description": "Keep git2 major bumps out of automated PRs; its TLS/feature story is environment-sensitive.",
+      "matchPackageNames": ["git2"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
