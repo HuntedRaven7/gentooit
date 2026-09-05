@@ -3,16 +3,12 @@
 //!
 //! The service is the "server" companion to the `gentooit` CLI (mirroring
 //! packit's CLI + service split). It listens for GitHub webhooks and triggers
-//! the appropriate workflow:
+//! the appropriate workflow in the background:
 //!
 //! * On a new upstream **release**, run `propose-downstream` to open an ebuild
 //!   PR against the downstream overlay.
 //! * On a **pull request** to the downstream overlay, run build/QA checks and
-//!   report status.
-//!
-//! This is a foundation: event verification (HMAC), GitHub App authentication,
-//! and wiring the workflows are designed in, with the actual long-running work
-//! intended to run out-of-band (e.g. a queue) in production.
+//!   post the results as a PR comment.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,15 +18,22 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use clap::Parser;
+use gentooit_core::build::{build, BuildMode};
+use gentooit_core::config::{ProjectConfig, UserConfig};
+use gentooit_core::propose::{propose_downstream, ProposeOptions};
+use gentooit_core::repo::Repo;
 
 /// The set of webhook events this service handles.
 #[derive(Clone)]
 struct AppState {
-    /// GitHub client authenticated as the GitHub App, used once the relevant
-    /// webhook events require calling back into GitHub.
+    /// GitHub client authenticated as the GitHub App.
     github: gentooit_core::github::GitHub,
     /// The webhook secret (HMAC key).
     webhook_secret: String,
+    /// GitHub App id (used to build UserConfig for workflow runs).
+    app_id: i64,
+    /// Path to the GitHub App private key PEM.
+    key_path: PathBuf,
 }
 
 #[derive(Parser)]
@@ -62,8 +65,6 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let args = Args::parse();
 
-    // Validate the app identity configuration early so a misconfigured service
-    // fails fast rather than at the first webhook.
     if args.app_id <= 0 {
         anyhow::bail!("GENTOOIT_APP_ID must be a positive GitHub App id");
     }
@@ -82,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         github,
         webhook_secret: args.webhook_secret,
+        app_id: args.app_id,
+        key_path: args.key_path,
     };
 
     let app = Router::new()
@@ -111,7 +114,6 @@ fn verify_signature(state: &AppState, signature: &str, body: &[u8]) -> bool {
     };
     mac.update(body);
     let expected = hex::encode(mac.finalize().into_bytes());
-    // Constant-time compare.
     let expected_bytes = expected.as_bytes();
     let given_bytes = hex_sig.as_bytes();
     if expected_bytes.len() != given_bytes.len() {
@@ -157,18 +159,35 @@ async fn handle_webhook(
 
     tracing::info!(%event, %action, "received verified webhook");
 
-    // Dispatch to the appropriate workflow. In production the heavy lifting
-    // would be queued/run in the background; here we log and acknowledge so the
-    // webhook returns promptly. The app-authenticated client is available on
-    // `state.github` for the handlers.
     match (event.as_str(), action.as_str()) {
         ("release", "published") => {
-            tracing::info!("release published -> would run propose-downstream");
-            let _ = &state.github;
+            let owner = parsed["repository"]["owner"]["login"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let repo = parsed["repository"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_propose_downstream(state, owner, repo).await;
+            });
         }
         ("pull_request", "opened" | "synchronize") => {
-            tracing::info!("pull request -> would run build/QA");
-            let _ = &state.github;
+            let owner = parsed["repository"]["owner"]["login"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let repo = parsed["repository"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let pr_number = parsed["pull_request"]["number"].as_u64().unwrap_or(0);
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = run_build(state, owner, repo, pr_number).await;
+            });
         }
         _ => {
             tracing::debug!("event {event}/{action} not handled");
@@ -178,6 +197,137 @@ async fn handle_webhook(
     Ok(Json(
         serde_json::json!({ "ok": true, "event": event, "action": action }),
     ))
+}
+
+/// Background runner: on a published release, fetch `.gentooit.yaml` from the
+/// upstream repo and run `propose-downstream`.
+async fn run_propose_downstream(
+    state: AppState,
+    owner: String,
+    repo: String,
+) -> anyhow::Result<()> {
+    let yaml = match state
+        .github
+        .fetch_file(&owner, &repo, ".gentooit.yaml")
+        .await?
+    {
+        Some(yaml) => yaml,
+        None => {
+            tracing::warn!(
+                "no .gentooit.yaml found in {owner}/{repo}, skipping propose-downstream"
+            );
+            return Ok(());
+        }
+    };
+
+    let project = ProjectConfig::from_yaml(&yaml)?;
+    let user = UserConfig::for_app(state.app_id, &state.key_path);
+
+    let workdir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("failed to create temp workdir: {e}");
+            return Ok(());
+        }
+    };
+
+    let result =
+        propose_downstream(&project, &user, ProposeOptions::default(), workdir.path()).await?;
+
+    tracing::info!(
+        version = %result.version,
+        package = %result.package,
+        pr = ?result.pull_request_url,
+        "propose-downstream completed"
+    );
+    Ok(())
+}
+
+/// Background runner: on a downstream PR, clone the repo and run build/QA
+/// checks, then post the results as a PR comment.
+async fn run_build(
+    state: AppState,
+    owner: String,
+    repo: String,
+    pr_number: u64,
+) -> anyhow::Result<()> {
+    let workdir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("failed to create temp workdir: {e}");
+            return Ok(());
+        }
+    };
+
+    let token = state
+        .github
+        .installation_token_for_repo(&owner, &repo)
+        .await?;
+
+    let url = format!("https://github.com/{owner}/{repo}.git");
+    if let Err(e) = Repo::clone(&url, workdir.path(), token.as_deref()) {
+        tracing::error!("failed to clone {owner}/{repo}: {e}");
+        return Ok(());
+    }
+
+    let project = match state
+        .github
+        .fetch_file(&owner, &repo, ".gentooit.yaml")
+        .await?
+    {
+        Some(yaml) => ProjectConfig::from_yaml(&yaml)?,
+        None => ProjectConfig::default(),
+    };
+
+    let report = build(&project, BuildMode::Check, workdir.path());
+
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("build/QA failed: {e}");
+            let body = format!("❌ gentooit build/QA errored: {e}");
+            let _ = post_comment(&state, &owner, &repo, pr_number, &body).await;
+            return Ok(());
+        }
+    };
+
+    tracing::info!(success = %report.success, exit = %report.exit_code, "build/QA completed");
+
+    let body = format_build_report(&report);
+    let _ = post_comment(&state, &owner, &repo, pr_number, &body).await;
+
+    Ok(())
+}
+
+/// Post a comment on a pull request.
+async fn post_comment(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    body: &str,
+) -> anyhow::Result<()> {
+    state.github.post_comment(owner, repo, number, body).await?;
+    Ok(())
+}
+
+/// Format a build report for a GitHub PR comment.
+fn format_build_report(report: &gentooit_core::build::BuildReport) -> String {
+    let status = if report.success {
+        "✅ passed"
+    } else {
+        "❌ failed"
+    };
+    let output = if report.output.len() > 5000 {
+        &report.output[..5000]
+    } else {
+        &report.output
+    };
+    format!(
+        "gentooit build/QA: {status} (exit {})\n<details><summary>output</summary>\n```\n{}\n```\n</details>",
+        report.exit_code,
+        output
+    )
 }
 
 fn init_tracing() {

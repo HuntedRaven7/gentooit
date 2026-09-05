@@ -22,3 +22,4 @@ axum = { version = "0.8", features = ["json"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = { workspace = true }
+tempfile = "3"

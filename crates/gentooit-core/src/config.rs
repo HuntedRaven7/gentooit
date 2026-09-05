@@ -55,6 +55,15 @@ impl UserConfig {
             .map(|u| u.to_string_lossy().to_string())
             .or_else(|| self.github_username_hint.clone())
     }
+
+    /// Build a UserConfig that authenticates via a GitHub App.
+    pub fn for_app(app_id: i64, key_path: &Path) -> Self {
+        Self {
+            github_app_id: Some(app_id),
+            github_app_key: Some(key_path.to_path_buf()),
+            ..Self::default()
+        }
+    }
 }
 
 impl UserConfig {
@@ -267,6 +276,12 @@ impl ProjectConfig {
     pub fn load(path: &Path) -> anyhow::Result<ProjectConfig> {
         let content = std::fs::read_to_string(path)?;
         let cfg: ProjectConfig = serde_yaml::from_str(&content)?;
+        Ok(cfg)
+    }
+
+    /// Parse a ProjectConfig from a YAML string.
+    pub fn from_yaml(content: &str) -> anyhow::Result<Self> {
+        let cfg: Self = serde_yaml::from_str(content)?;
         Ok(cfg)
     }
 }

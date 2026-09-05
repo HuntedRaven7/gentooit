@@ -38,10 +38,28 @@ pub async fn sync_from_downstream(
         )
     })?;
 
-    let github = match &user.github_token {
-        Some(tok) => GitHub::with_token(tok)?,
-        None => GitHub::anonymous()?,
+    let github = if let (Some(app_id), Some(key_path)) = (&user.github_app_id, &user.github_app_key)
+    {
+        let app = GitHub::with_app(*app_id, key_path)?;
+        // For sync we don't have a downstream repo URL yet; use the upstream
+        // repo to discover the installation (the App must be installed on the
+        // upstream repo to open PRs there).
+        let installation = app.get_repository_installation(owner, repo_name).await?;
+        app.with_installation(*installation.id)?
+    } else if let Some(tok) = &user.github_token {
+        GitHub::with_token(tok)?
+    } else {
+        GitHub::anonymous()?
     };
+
+    // Resolve the authenticated user's login for fork refs. Falls back to the
+    // config hint / env var when the client is unauthenticated or the API call
+    // fails.
+    let username = match github.resolve_username().await {
+        Ok(name) => name,
+        Err(_) => user.github_username().unwrap_or_else(|| "USER".to_string()),
+    };
+    tracing::info!(%username, "resolved GitHub username");
 
     // The downstream package files live in `workdir` (a checkout of the
     // overlay). Determine which files to copy based on `files_to_sync`, or a
@@ -57,7 +75,7 @@ pub async fn sync_from_downstream(
             owner,
             repo_name,
             "Sync distro packaging files from Gentoo",
-            &format!("{}:{branch}", fork_owner(user)),
+            &format!("{}:{branch}", fork_owner(&username)),
             &default_branch,
             &sync_body(&files),
         )
@@ -79,8 +97,8 @@ fn split_upstream(upstream: &UpstreamConfig) -> Option<(&str, &str)> {
     Some((owner, repo))
 }
 
-fn fork_owner(user: &UserConfig) -> String {
-    user.github_username().unwrap_or_else(|| "USER".to_string())
+fn fork_owner(username: &str) -> String {
+    username.to_string()
 }
 
 /// Determine which files to sync, mirroring packit's `files_to_sync`.

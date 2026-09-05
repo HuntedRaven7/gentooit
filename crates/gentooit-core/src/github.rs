@@ -11,6 +11,8 @@
 //! For the service layer, the same client supports GitHub App authentication
 //! (JWT + installation tokens) so the service can act on behalf of repositories.
 
+use base64::engine::{general_purpose::STANDARD, Engine};
+use secrecy::ExposeSecret;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -61,6 +63,84 @@ impl GitHub {
         Ok(GitHub {
             inner: Arc::new(inner),
         })
+    }
+
+    /// Get the GitHub App installation for a repository. Requires App auth.
+    pub async fn get_repository_installation(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> anyhow::Result<octocrab::models::Installation> {
+        let installation = self
+            .inner
+            .apps()
+            .get_repository_installation(owner, repo)
+            .await?;
+        Ok(installation)
+    }
+
+    /// Fetch a text file from a repository root. Returns None if the file does
+    /// not exist.
+    pub async fn fetch_file(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let route = format!("/repos/{owner}/{repo}/contents/{path}");
+        let json: serde_json::Value = match self.inner.get(&route, None::<&()>).await {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let content = match json.get("content").and_then(|c| c.as_str()) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        let decoded = STANDARD.decode(content.replace('\n', ""))?;
+        Ok(Some(String::from_utf8(decoded)?))
+    }
+
+    /// Get an installation access token for a repository's installation.
+    pub async fn installation_token_for_repo(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let installation = self.get_repository_installation(owner, repo).await?;
+        let client = self.with_installation(*installation.id)?;
+        client.installation_token().await
+    }
+
+    /// Resolve the authenticated user's login from the current token. Works
+    /// for PATs, fine-grained tokens, and GitHub App user access tokens.
+    pub async fn resolve_username(&self) -> anyhow::Result<String> {
+        let user = self.inner.current().user().await?;
+        Ok(user.login)
+    }
+
+    /// Get an installation access token if this client is authenticated as a
+    /// GitHub App installation. Returns None if not an installation client or
+    /// if the request fails.
+    pub async fn installation_token(&self) -> anyhow::Result<Option<String>> {
+        match self.inner.installation_token().await {
+            Ok(token) => Ok(Some(token.expose_secret().to_string())),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Post a comment on an issue or pull request.
+    pub async fn post_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .issues(owner, repo)
+            .create_comment(number, body)
+            .await?;
+        Ok(())
     }
 
     /// Fetch the latest release for `owner/repo`. Returns None if there are no

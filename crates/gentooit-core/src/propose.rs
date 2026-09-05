@@ -10,6 +10,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 
+use crate::build::{pkgcheck_scan, pkgdev_manifest, BuildError};
 use crate::config::{DownstreamConfig, ProjectConfig, UpstreamConfig, UserConfig};
 use crate::ebuild::{Atom, EbuildMetadata, PackageName};
 use crate::github::{GitHub, Release, ReleaseAsset};
@@ -42,6 +43,8 @@ pub struct DownstreamFiles {
     pub branch: String,
     /// PR URL if a pull request was opened, or None if only committed/pushed.
     pub pull_request_url: Option<String>,
+    /// Optional summary of QA tool results (pkgcheck/pkgdev) from the run.
+    pub qa_summary: Option<String>,
 }
 
 /// The result of a propose-downstream run.
@@ -85,12 +88,45 @@ pub async fn propose_downstream(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no `upstream` section in project config"))?;
 
-    let github = match &user.github_token {
-        Some(tok) => GitHub::with_token(tok)?,
-        // Without a token we can still read public releases and download public
-        // archives; opening a PR later requires one and will error then.
-        None => GitHub::anonymous()?,
+    let downstream = project
+        .downstream
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no `downstream` targets configured"))?;
+
+    // Resolve the downstream owner/repo early so App auth can discover the
+    // installation for the correct repository.
+    let (downstream_owner, downstream_repo) = split_remote(&downstream.url);
+    let (downstream_owner, downstream_repo) = match (downstream_owner, downstream_repo) {
+        (Some(o), Some(r)) => (o, r),
+        _ => anyhow::bail!("invalid downstream URL: {}", downstream.url),
     };
+
+    let github = if let (Some(app_id), Some(key_path)) = (&user.github_app_id, &user.github_app_key)
+    {
+        let app = GitHub::with_app(*app_id, key_path)?;
+        let installation = app
+            .get_repository_installation(&downstream_owner, &downstream_repo)
+            .await?;
+        tracing::info!(
+            installation_id = %installation.id,
+            account = %installation.account.login,
+            "resolved GitHub App installation"
+        );
+        app.with_installation(*installation.id)?
+    } else if let Some(tok) = &user.github_token {
+        GitHub::with_token(tok)?
+    } else {
+        GitHub::anonymous()?
+    };
+
+    // Resolve the authenticated user's login for fork refs. Falls back to the
+    // config hint / env var when the client is unauthenticated or the API call
+    // fails.
+    let username = match github.resolve_username().await {
+        Ok(name) => name,
+        Err(_) => user.github_username().unwrap_or_else(|| "USER".to_string()),
+    };
+    tracing::info!(%username, "resolved GitHub username");
 
     // 1. Discover the release. Keep the release object (with its assets) so we
     //    can pick a source archive from attached release assets.
@@ -197,6 +233,8 @@ pub async fn propose_downstream(
         &manifest,
         &package_name,
         workdir,
+        options.no_qa,
+        &username,
     )
     .await?;
 
@@ -888,6 +926,8 @@ async fn apply_to_downstream(
     manifest: &Manifest,
     package_name: &str,
     workdir: &Path,
+    no_qa: bool,
+    username: &str,
 ) -> anyhow::Result<DownstreamFiles> {
     // Determine the downstream clone location.
     let dest = downstream
@@ -954,6 +994,54 @@ async fn apply_to_downstream(
     repo.write_file(&metadata_rel, metadata_content)?;
     repo.write_file(&manifest_rel, &manifest.to_string_sorted())?;
 
+    let qa_summary = if !no_qa {
+        let pkg_dir_path = repo.path.join(&pkg_dir);
+        let mut lines = Vec::new();
+
+        match pkgdev_manifest(&pkg_dir_path) {
+            Ok(report) => {
+                if report.success {
+                    lines.push("pkgdev manifest: passed".to_string());
+                } else {
+                    tracing::warn!("pkgdev manifest failed:\n{}", report.output);
+                    lines.push(format!(
+                        "pkgdev manifest: failed (exit {})",
+                        report.exit_code
+                    ));
+                }
+            }
+            Err(BuildError::ToolNotFound { .. }) => {}
+            Err(e) => {
+                tracing::warn!("pkgdev manifest error: {e}");
+                lines.push(format!("pkgdev manifest: {e}"));
+            }
+        }
+
+        match pkgcheck_scan(&pkg_dir_path) {
+            Ok(report) => {
+                if report.success {
+                    lines.push("pkgcheck scan: passed".to_string());
+                } else {
+                    tracing::warn!("pkgcheck scan failed:\n{}", report.output);
+                    lines.push(format!("pkgcheck scan: failed (exit {})", report.exit_code));
+                }
+            }
+            Err(BuildError::ToolNotFound { .. }) => {}
+            Err(e) => {
+                tracing::warn!("pkgcheck scan error: {e}");
+                lines.push(format!("pkgcheck scan: {e}"));
+            }
+        }
+
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    } else {
+        None
+    };
+
     // Stage them.
     repo.add_path(&ebuild_rel, false)?;
     repo.add_path(&metadata_rel, false)?;
@@ -978,7 +1066,17 @@ async fn apply_to_downstream(
     // Push the feature branch to the downstream remote, then open a PR. The
     // push may fail for local-path remotes that cannot authenticate or for
     // read-only check-outs; report it but do not fail the whole run.
-    match repo.push("origin", &branch, user.github_token.as_deref()) {
+    let push_token = if let Some(tok) = &user.github_token {
+        Some(tok.clone())
+    } else if user.github_app_id.is_some() && user.github_app_key.is_some() {
+        match github.installation_token().await {
+            Ok(Some(tok)) => Some(tok),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    match repo.push("origin", &branch, push_token.as_deref()) {
         Ok(()) => tracing::info!(%branch, "pushed branch to origin"),
         Err(e) => tracing::warn!("failed to push branch {branch}: {e}"),
     }
@@ -994,9 +1092,9 @@ async fn apply_to_downstream(
                     &up_owner,
                     &up_repo,
                     &msg,
-                    &format!("{}:{branch}", fork_owner(user)),
+                    &format!("{}:{branch}", fork_owner(username)),
                     &base_branch,
-                    &pr_body(atom, version, project),
+                    &pr_body(atom, version, project, qa_summary.as_deref()),
                 )
                 .await
             {
@@ -1024,13 +1122,12 @@ async fn apply_to_downstream(
         manifest_path: manifest_rel,
         branch,
         pull_request_url: pr_url,
+        qa_summary,
     })
 }
 
-fn fork_owner(user: &UserConfig) -> String {
-    // Best-effort: the token owner. We don't retain the owner in UserConfig, so
-    // default to a placeholder that callers can override by resolving the user.
-    user.github_username().unwrap_or_else(|| "USER".to_string())
+fn fork_owner(username: &str) -> String {
+    username.to_string()
 }
 
 fn own_repo_name(project: &ProjectConfig) -> String {
@@ -1059,18 +1156,33 @@ fn split_remote(url: &str) -> (Option<String>, Option<String>) {
     )
 }
 
-fn pr_body(atom: &Atom, version: &str, project: &ProjectConfig) -> String {
+fn pr_body(
+    atom: &Atom,
+    version: &str,
+    project: &ProjectConfig,
+    qa_summary: Option<&str>,
+) -> String {
     let upstream = project
         .upstream
         .as_ref()
         .and_then(|u| u.upstream.clone())
         .unwrap_or_default();
-    format!(
+    let mut body = format!(
         "Automated by gentooit.\n\n\
          Bump **{atom}** to version **{version}**.\n\
          - Upstream: {upstream}\n\
          - Updated ebuild, metadata.xml, and Manifest."
-    )
+    );
+    if let Some(qa) = qa_summary {
+        body.push('\n');
+        body.push_str("- QA:\n");
+        for line in qa.lines() {
+            body.push_str("  - ");
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    body
 }
 
 #[cfg(test)]
