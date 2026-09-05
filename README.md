@@ -157,11 +157,11 @@ Key design choices:
   filenames that don't match `${P}`)
 - [x] Ebuild "diff-bump" of an existing ebuild (preserve custom `src_*`
   functions) instead of always generating fresh
-- [ ] `pkgcheck scan` / `pkgdev manifest` integration in `propose-downstream`
+- [x] `pkgcheck scan` / `pkgdev manifest` integration in `propose-downstream`
   before opening the PR (when tools are present)
-- [ ] Resolve the GitHub username from the token, and support GitHub App
+- [x] Resolve the GitHub username from the token, and support GitHub App
   authentication for PR creation
-- [ ] Wire `gentooit-service` webhooks to the actual workflows (queue +
+- [x] Wire `gentooit-service` webhooks to the actual workflows (queue +
   background runners)
 - [ ] `sync-from-downstream` local mode that copies files into the upstream
   worktree and commits
