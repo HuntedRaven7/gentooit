@@ -4,13 +4,14 @@
 ebuilds — the same way [packit](https://github.com/packit/packit) automates
 packaging upstream projects into Fedora.
 
-gentooit is a CLI tool (with a GitHub App service) that continuously moves
-software between two sides of the packaging river:
+gentooit has two parts:
 
-- **upstream** — a developer's project on GitHub (the source of truth for
-  releases)
-- **downstream** — the Gentoo distribution, where ebuilds live in
-  `gentoo/gentoo` or in a Gentoo overlay
+- **CLI** (`gentooit`) — run locally or in CI to propose ebuilds, run QA, and
+  sync packaging files.
+- **Service** (`gentooit-service`) — a GitHub App that watches upstream releases
+  and downstream PRs, then runs the workflows automatically. This is the
+  differentiator: once configured, new upstream releases turn into downstream
+  PRs without anyone touching a keyboard.
 
 ```
    upstream project            downstream (Gentoo)
@@ -25,6 +26,16 @@ software between two sides of the packaging river:
    └──────────────┘
 ```
 
+The service handles the full loop:
+
+1. A new upstream release fires a webhook
+2. gentooit-service downloads the archive, generates the ebuild + Manifest +
+   metadata.xml, runs `pkgcheck` / `pkgdev` if available
+3. It opens a PR against the downstream overlay
+4. On downstream PRs, it runs build/QA and posts the results as a comment
+
+No manual `propose-downstream` invocation required.
+
 ## Workflows
 
 gentooit mirrors the packit workflow set for Gentoo:
@@ -35,10 +46,6 @@ gentooit mirrors the packit workflow set for Gentoo:
 | `gentooit build`            | `packit build`           | Run `pkgcheck scan` (QA) and/or `emerge` build an ebuild in the downstream check-out. Also emits a GitHub Actions workflow that builds in a `gentoo/stage3` container. |
 | `gentooit sync-from-downstream` | `packit sync-from-downstream` | Copy packaging files from the downstream ebuild repository back into the upstream project via a PR. |
 | `gentooit init`             | `packit init`            | Scaffold a `.gentooit.yaml` project config. |
-
-`gentooit-service` is the server counterpart to the CLI (our analogue of
-packit-service): a GitHub App webhook endpoint that triggers
-`propose-downstream` on new releases and build/QA on downstream PRs.
 
 ## Installation
 
@@ -100,6 +107,109 @@ app-misc/ripgrep/metadata.xml           # maintainer, bugs-to, remote-id
 
 The `Manifest` hashes are generated with the current Gentoo policy (`SHA256` +
 `SHA512`), so the ebuild is immediately buildable and passes `pkgcheck`.
+
+## Deploying the service (hands-off automation)
+
+The CLI is great for one-offs, but the real leverage comes from running
+`gentooit-service` as a GitHub App. Once deployed, the service watches your
+upstream repos and downstream overlays and opens PRs automatically.
+
+### What the service does
+
+| Webhook event | Action |
+|---------------|--------|
+| `release: published` on upstream | Downloads the archive, generates ebuild + Manifest + metadata.xml, runs QA if tools are present, opens a PR against the downstream overlay |
+| `pull_request: opened / synchronize` on downstream | Clones the overlay, runs `pkgcheck scan` / `pkgdev manifest`, posts results as a PR comment |
+
+Everything runs in the background (`tokio::spawn`), so the webhook returns
+immediately and the heavy work happens out-of-band.
+
+### 1. Create a GitHub App
+
+1. Go to **Settings → Developer settings → GitHub Apps → New GitHub App**
+2. Name: `gentooit` (or whatever you prefer)
+3. **Webhook**:
+   - URL: `https://your-host:3000/` (or wherever you deploy)
+   - Secret: generate a random string, save it as `GENTOOIT_WEBHOOK_SECRET`
+4. **Permissions**:
+   - Pull requests: **Read & write**
+   - Contents: **Read & write** (to fetch `.gentooit.yaml` and post comments)
+   - Metadata: **Read-only** (always selected)
+5. **Subscribe to events**:
+   - Release
+   - Pull request
+6. Create the app. Note the **App ID** and download the **Private key** (PEM file)
+
+### 2. Install the App on your repos
+
+1. In the GitHub App settings, click **Install App**
+2. Choose the organization/account
+3. Select the upstream repos (to watch releases) and downstream overlay repos
+   (to open PRs and post comments)
+4. The installation ID is resolved automatically per-repo at runtime
+
+### 3. Run the service
+
+```sh
+export GENTOOIT_APP_ID=123456
+export GENTOOIT_APP_KEY=/path/to/private-key.pem
+export GENTOOIT_WEBHOOK_SECRET=your-webhook-secret
+
+gentooit-service --port 3000
+```
+
+For production, run it behind a reverse proxy (nginx, Caddy) with TLS. GitHub
+requires HTTPS webhooks unless you use `ngrok` for testing.
+
+### 4. Configure your project
+
+The service fetches `.gentooit.yaml` from the upstream repo root at runtime.
+No per-service config needed — just add the project config to your upstream
+repo:
+
+```yaml
+spec_version: "1.0"
+upstream:
+  vcs: github
+  upstream: BurntSushi/ripgrep
+  package_name: ripgrep
+  tag_template: "v{version}"
+package:
+  description: Recursively search directories for a regex pattern
+  homepage: https://github.com/BurntSushi/ripgrep
+  license: Unlicense
+  keywords: "~amd64"
+  maintainer_email: you@example.com
+downstream:
+  - url: git@github.com:gentoo/gentoo.git
+    branch: master
+    category: app-misc
+open_pull_request: true
+```
+
+That's it. Push a new release upstream and gentooit-service will open a PR
+downstream.
+
+### 5. Systemd service (optional)
+
+```ini
+[Unit]
+Description=gentooit-service
+After=network.target
+
+[Service]
+Type=simple
+User=gentooit
+WorkingDirectory=/opt/gentooit
+ExecStart=/opt/gentooit/target/release/gentooit-service --port 3000
+Environment="GENTOOIT_APP_ID=123456"
+Environment="GENTOOIT_APP_KEY=/etc/gentooit/private-key.pem"
+Environment="GENTOOIT_WEBHOOK_SECRET=your-webhook-secret"
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Configuration reference
 
@@ -163,15 +273,13 @@ Key design choices:
   authentication for PR creation
 - [x] Wire `gentooit-service` webhooks to the actual workflows (queue +
   background runners)
-- [ ] `sync-from-downstream` local mode that copies files into the upstream
+- [x] `sync-from-downstream` local mode that copies files into the upstream
   worktree and commits
-
-## License
 
 ## Maintenance
 
 - **CI** (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, and `cargo audit` (RUSTSEC).
-- **Renovate** (`renovate.json`) keeps Cargo dependencies up to date. Note the deliberate coupling rules: `octocrab`/`jsonwebtoken` are grouped (their majors must track each other), `hmac`/`sha2` are paired (the service pins `sha2 0.10` to match `hmac 0.12`'s digest), and `git2` major bumps require manual approval.
+- **Renovate** (`renovate.json`) keeps Cargo dependencies up to date. Note the deliberate coupling rules: `octocrab`/`jsonwebtoken` are grouped (their majors must track each other), `hmac`/`sha2` are paired (the service pins `sha2 0.10` to match `hmac 0.12`'s digest), and `git2` major bumps require manual approval).
 
 ## License
 
