@@ -7,6 +7,7 @@
 //! 3. Derive/create the ebuild, its `metadata.xml`, and the `Manifest`.
 //! 4. Clone the downstream overlay, create a branch, commit, push, and open a PR.
 
+use std::cmp::Ordering;
 use std::path::Path;
 
 use crate::config::{DownstreamConfig, ProjectConfig, UpstreamConfig, UserConfig};
@@ -737,6 +738,142 @@ fn load_existing_manifest(
     }
 }
 
+/// Ebuild variables that `gentooit` (re)generates and rewrites on a bump.
+/// Everything else in an existing ebuild is treated as user content and
+/// preserved verbatim.
+const MANAGED_VARS: [&str; 12] = [
+    "EAPI",
+    "DESCRIPTION",
+    "HOMEPAGE",
+    "SRC_URI",
+    "LICENSE",
+    "SLOT",
+    "KEYWORDS",
+    "S",
+    "IUSE",
+    "DEPEND",
+    "RDEPEND",
+    "BDEPEND",
+];
+
+/// If `line` assigns one of the managed ebuild variables, return its name.
+fn managed_var_name(line: &str) -> Option<&'static str> {
+    MANAGED_VARS
+        .iter()
+        .find(|v| {
+            line.strip_prefix(*v)
+                .is_some_and(|rest| rest.starts_with('='))
+        })
+        .copied()
+}
+
+/// The stock Gentoo header lines, re-emitted from the fresh render.
+fn is_ebuild_header(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("# Copyright") || t.starts_with("# Distributed under the terms of")
+}
+
+/// Merge a freshly rendered (generated) ebuild with an existing one, keeping
+/// the managed variables from the fresh render while preserving any custom
+/// content from the old file (hand-written `src_*` functions, `RESTRICT`,
+/// `QA_*`, comments, etc.).
+fn render_diff_bump(old_content: &str, fresh_content: &str) -> String {
+    let fresh_lines: Vec<&str> = fresh_content.lines().collect();
+    let last_managed = fresh_lines
+        .iter()
+        .rposition(|l| managed_var_name(l).is_some())
+        .unwrap_or_else(|| fresh_lines.len().saturating_sub(1));
+
+    // Head: everything in the fresh render up to its last managed variable
+    // (header comments, the variable block, and its formatting).
+    let head = &fresh_lines[..=last_managed];
+
+    // Tail: the old ebuild's lines that aren't a regenerated variable or the
+    // stock header.
+    let mut tail: Vec<&str> = Vec::new();
+    for line in old_content.lines() {
+        if managed_var_name(line).is_some() || is_ebuild_header(line) {
+            continue;
+        }
+        tail.push(line);
+    }
+    while tail.first().is_some_and(|l| l.trim().is_empty()) {
+        tail.remove(0);
+    }
+    while tail.last().is_some_and(|l| l.trim().is_empty()) {
+        tail.pop();
+    }
+
+    let mut out = head.join("\n");
+    if !tail.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&tail.join("\n"));
+    }
+    out.push('\n');
+    out
+}
+
+/// Ebuilds already present for a package, as (version, content) pairs.
+fn existing_ebuilds(pkg_dir: &Path) -> Vec<(String, String)> {
+    let entries = match std::fs::read_dir(pkg_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(stem) = name.strip_suffix(".ebuild") else {
+            continue;
+        };
+        // Ebuild names are `{package}-{version}.ebuild`; package names can't
+        // contain `-`, so the version is everything after the first dash.
+        let Some((_, version)) = stem.split_once('-') else {
+            continue;
+        };
+        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            out.push((version.to_string(), content));
+        }
+    }
+    out
+}
+
+/// Pick the existing ebuild to diff-bump: the newest version at or below the
+/// proposed version (or the newest overall if only later versions exist).
+fn pick_base_ebuild(existing: &[(String, String)], new_version: &str) -> Option<String> {
+    existing
+        .iter()
+        .filter(|(ver, _)| compare_versions(ver, new_version) != Ordering::Greater)
+        .max_by(|a, b| compare_versions(&a.0, &b.0))
+        .or_else(|| existing.iter().max_by(|a, b| compare_versions(&a.0, &b.0)))
+        .map(|(_, c)| c.clone())
+}
+
+/// Approximate Gentoo version ordering: split on `.`, `-`, `_`, `+` and compare
+/// pieces numerically when possible, lexically otherwise.
+fn compare_versions(a: &str, b: &str) -> Ordering {
+    let ta = version_tokens(a);
+    let tb = version_tokens(b);
+    for (x, y) in ta.iter().zip(tb.iter()) {
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(xn), Ok(yn)) => xn.cmp(&yn),
+            (Ok(_), Err(_)) => Ordering::Greater,
+            (Err(_), Ok(_)) => Ordering::Less,
+            (Err(_), Err(_)) => x.cmp(y),
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    ta.len().cmp(&tb.len())
+}
+
+fn version_tokens(v: &str) -> Vec<String> {
+    v.split(['.', '-', '_', '+'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Scan the downstream repo for where to place the files and apply the change.
 #[allow(clippy::too_many_arguments)]
 async fn apply_to_downstream(
@@ -798,8 +935,22 @@ async fn apply_to_downstream(
     let metadata_rel = format!("{pkg_dir}/metadata.xml");
     let manifest_rel = format!("{pkg_dir}/Manifest");
 
+    // Diff-bump: when an older ebuild for this package already exists in the
+    // working tree, preserve its custom content (hand-written `src_*`
+    // functions, `RESTRICT`/`QA_*` variables, comments) instead of starting
+    // from a blank slate. Only the managed variables track the fresh render.
+    let existing = existing_ebuilds(&repo.path.join(&pkg_dir));
+    let base_ebuild = pick_base_ebuild(&existing, version);
+    let (is_bump, ebuild_content) = match base_ebuild {
+        Some(old) => {
+            tracing::info!(pkg = %pkg_dir, "diff-bumping existing ebuild, preserving custom bits");
+            (true, render_diff_bump(&old, ebuild_content))
+        }
+        None => (false, ebuild_content.to_string()),
+    };
+
     // Write files into the working tree.
-    repo.write_file(&ebuild_rel, ebuild_content)?;
+    repo.write_file(&ebuild_rel, &ebuild_content)?;
     repo.write_file(&metadata_rel, metadata_content)?;
     repo.write_file(&manifest_rel, &manifest.to_string_sorted())?;
 
@@ -817,7 +968,11 @@ async fn apply_to_downstream(
         .git_author_email
         .clone()
         .unwrap_or_else(|| "gentooit@localhost".to_string());
-    let msg = format!("{pkg_dir}: add version {version}");
+    let msg = if is_bump {
+        format!("{pkg_dir}: bump to version {version}")
+    } else {
+        format!("{pkg_dir}: add version {version}")
+    };
     repo.commit(&author_name, &author_email, &msg)?;
 
     // Push the feature branch to the downstream remote, then open a PR. The
@@ -838,7 +993,7 @@ async fn apply_to_downstream(
                 .create_pull_request(
                     &up_owner,
                     &up_repo,
-                    &format!("{pkg_dir}: add version {version}"),
+                    &msg,
                     &format!("{}:{branch}", fork_owner(user)),
                     &base_branch,
                     &pr_body(atom, version, project),
@@ -1172,5 +1327,135 @@ mod tests {
         let md = render_metadata(&project, &user, &UpstreamConfig::default(), "alice", "foo");
         assert!(md.contains("<email>dev@example.com</email>"));
         assert!(md.contains("<name>Dev</name>"));
+    }
+
+    #[test]
+    fn render_diff_bump_preserves_custom_functions() {
+        let old = "\
+# Copyright 1999-2026 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
+
+EAPI=8
+
+DESCRIPTION=\"old\"
+HOMEPAGE=\"https://old\"
+SRC_URI=\"https://example.com/download/${PV}/old-${PV}.tar.gz\"
+
+LICENSE=\"old\"
+SLOT=\"0\"
+KEYWORDS=\"~amd64\"
+S=\"${WORKDIR}/old-${PV}\"
+
+RESTRICT=\"test\"
+
+src_prepare() {
+\tsed -i 's/hello/world/' main.c || die
+}
+
+src_install() {
+\tdefault
+}
+";
+        let fresh = render_ebuild(
+            PackageName::new("foo").unwrap(),
+            "2.0.0",
+            &ProjectConfig::default(),
+            "foo",
+            "https://example.com/download/${PV}/foo-${PV}.tar.gz",
+            None,
+        );
+        let merged = render_diff_bump(old, &fresh);
+
+        // Managed variables track the fresh render.
+        assert!(merged.contains("DESCRIPTION=\"foo - packaged by gentooit\""));
+        assert!(merged.contains("SRC_URI=\"https://example.com/download/${PV}/foo-${PV}.tar.gz\""));
+        assert!(merged.contains("KEYWORDS=\"~amd64\""));
+        // Stale managed variable from the old version is dropped (fresh has no S).
+        assert!(!merged.contains("old-${PV}"));
+        assert!(
+            !merged.lines().any(|l| l.starts_with("S=")),
+            "stale S should be dropped"
+        );
+        // Custom content survives.
+        assert!(merged.contains("RESTRICT=\"test\""));
+        assert!(merged.contains("src_prepare() {"));
+        assert!(merged.contains("sed -i 's/hello/world/' main.c || die"));
+        assert!(merged.trim_end().ends_with("src_install() {\n\tdefault\n}"));
+    }
+
+    #[test]
+    fn render_diff_bump_adds_s_from_fresh() {
+        let old = "\
+# Copyright 1999-2026 Gentoo Authors
+# Distributed under the terms of the GNU General Public License v2
+
+EAPI=8
+DESCRIPTION=\"d\"
+SRC_URI=\"https://example.com/${PV}/deps-${PV}.tar.gz\"
+
+LICENSE=\"MIT\"
+SLOT=\"0\"
+
+# Keep this comment
+src_compile() {
+\tcargo build
+}
+";
+        let fresh = render_ebuild(
+            PackageName::new("foo").unwrap(),
+            "1.0.0",
+            &ProjectConfig::default(),
+            "foo",
+            "https://example.com/${PV}/source.tar.gz",
+            Some("${WORKDIR}/source"),
+        );
+        let merged = render_diff_bump(old, &fresh);
+
+        // The fresh render's S override is inserted.
+        assert!(merged.contains("S=\"${WORKDIR}/source\""));
+        // Custom comment and function are kept.
+        assert!(merged.contains("# Keep this comment"));
+        assert!(merged.contains("cargo build"));
+        // The fresh render's own src_install is not duplicated (old has none).
+        assert_eq!(merged.matches("src_install").count(), 0);
+    }
+
+    #[test]
+    fn compare_versions_orders_correctly() {
+        assert_eq!(compare_versions("1.0.0", "1.1.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.1.0", "1.1.0-r1"), Ordering::Less);
+        assert_eq!(compare_versions("1.1.0-r1", "1.1.0-r2"), Ordering::Less);
+        assert_eq!(compare_versions("0.16.5", "0.16.6"), Ordering::Less);
+        assert_eq!(compare_versions("9.0.0", "10.0.0"), Ordering::Less);
+        assert_eq!(compare_versions("2.0.0", "2.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.5.0", "1.0.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn pick_base_ebuild_selects_newest_below_or_equal() {
+        let existing = vec![
+            ("1.0.0".to_string(), "c1".to_string()),
+            ("1.5.0".to_string(), "c2".to_string()),
+            ("2.0.0".to_string(), "c3".to_string()),
+        ];
+        assert_eq!(pick_base_ebuild(&existing, "1.9.9").as_deref(), Some("c2"));
+        // Equal version bumps in place.
+        assert_eq!(pick_base_ebuild(&existing, "2.0.0").as_deref(), Some("c3"));
+        // Only newer versions exist: fall back to the newest overall.
+        assert_eq!(pick_base_ebuild(&existing, "0.9.0").as_deref(), Some("c3"));
+    }
+
+    #[test]
+    fn existing_ebuilds_scans_only_ebuild_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(dir.path().join("foo-1.0.0.ebuild"), "EAPI=8").unwrap();
+        std::fs::write(dir.path().join("foo-1.1.0.ebuild"), "EAPI=8").unwrap();
+        std::fs::write(dir.path().join("Manifest"), "DIST x 1").unwrap();
+        std::fs::write(dir.path().join("README.md"), "hi").unwrap();
+        let found = existing_ebuilds(dir.path());
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|(v, _)| v == "1.0.0"));
+        assert!(found.iter().any(|(v, _)| v == "1.1.0"));
     }
 }

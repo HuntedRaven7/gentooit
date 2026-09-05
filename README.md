@@ -155,7 +155,7 @@ Key design choices:
 
 - [x] Use GitHub release **assets** and `S` override detection (derive archive
   filenames that don't match `${P}`)
-- [ ] Ebuild "diff-bump" of an existing ebuild (preserve custom `src_*`
+- [x] Ebuild "diff-bump" of an existing ebuild (preserve custom `src_*`
   functions) instead of always generating fresh
 - [ ] `pkgcheck scan` / `pkgdev manifest` integration in `propose-downstream`
   before opening the PR (when tools are present)
