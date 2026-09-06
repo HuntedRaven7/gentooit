@@ -236,6 +236,23 @@ pub struct PackageConfig {
     #[serde(default)]
     pub bdepend: Option<String>,
     #[serde(default)]
+    pub restrict: Option<String>,
+    /// Eclass(es) to `inherit`, e.g. `meson` or `zig xdg`. Overrides the
+    /// build-system detection when set.
+    #[serde(default)]
+    pub inherit: Option<String>,
+    /// Build system preset used to render phase functions when no `inherit`
+    /// is configured: `plain`, `cargo`, `meson`, `cmake`, or `zig`. Defaults
+    /// to auto-detection from the source archive.
+    #[serde(default)]
+    pub build_system: Option<String>,
+    /// Raw ebuild phase bodies (`src_configure() { ... }`, etc.) appended to
+    /// the generated ebuild when the presets aren't enough. Diff-bumps
+    /// preserve anything starting from here, so hand-written phases survive
+    /// version bumps.
+    #[serde(default)]
+    pub src_functions: Option<String>,
+    #[serde(default)]
     pub maintainer_email: Option<String>,
     #[serde(default)]
     pub maintainer_name: Option<String>,

@@ -185,8 +185,15 @@ pub async fn propose_downstream(
     // 4. Compose ebuild content and Manifest.
     let atom = Atom::new(&derive_category(project, upstream)?, &package_name)?;
 
-    let is_cargo = detect_cargo(&archive_path)?;
-    tracing::debug!(is_cargo, "detected project type");
+    // Detect the build system from the archive; an explicit `build-system`
+    // config entry overrides detection.
+    let build_system = project
+        .package
+        .as_ref()
+        .and_then(|p| p.build_system.as_deref())
+        .and_then(BuildSystem::from_config_value)
+        .unwrap_or_else(|| detect_build_system(&archive_path).unwrap_or(BuildSystem::Plain));
+    tracing::debug!(?build_system, "resolved build system");
 
     let ebuild_content = render_ebuild(
         atom.package.clone(),
@@ -195,7 +202,7 @@ pub async fn propose_downstream(
         &package_name,
         &archive.src_uri,
         archive.extract_dir.as_deref(),
-        is_cargo,
+        build_system,
     );
     let ebuild_filename = format!("{package_name}-{version}.ebuild");
 
@@ -617,16 +624,91 @@ fn url_basename(url: &str) -> String {
     url.rsplit('/').next().unwrap_or(url).to_string()
 }
 
-/// Detect whether the source archive contains a Rust `Cargo.toml`.
-fn detect_cargo(archive_path: &Path) -> anyhow::Result<bool> {
-    let output = Command::new("tar").arg("-tzf").arg(archive_path).output()?;
+/// Build system detected in a source archive, used to pick the eclass and
+/// phase functions a generated ebuild needs. `inherit`/`build-system` in the
+/// package config override detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildSystem {
+    Plain,
+    Cargo,
+    Meson,
+    Cmake,
+    Zig,
+}
+
+impl BuildSystem {
+    /// Whether the build system's eclass phase functions run on their own.
+    pub fn inherit(&self) -> Option<&'static str> {
+        match self {
+            BuildSystem::Plain => None,
+            BuildSystem::Cargo => Some("cargo"),
+            BuildSystem::Meson => Some("meson"),
+            BuildSystem::Cmake => Some("cmake"),
+            BuildSystem::Zig => Some("zig"),
+        }
+    }
+
+    /// The standard phase-function bodies for the eclass. Zig's eclass does
+    /// not `EXPORT_FUNCTIONS`, so its callers must wire the functions up
+    /// themselves; the other presets rely on the eclass.
+    pub fn src_functions(&self) -> &'static str {
+        match self {
+            BuildSystem::Zig => {
+                "src_configure() {\n\tzig_src_configure\n}\n\n\
+                 src_compile() {\n\tzig_src_compile\n}\n\n\
+                 src_test() {\n\tzig_src_test\n}\n\n\
+                 src_install() {\n\tzig_src_install\n}\n"
+            }
+            BuildSystem::Plain => "src_install() {\n\tdefault\n}\n",
+            BuildSystem::Cargo | BuildSystem::Meson | BuildSystem::Cmake => {
+                "src_install() {\n\tdefault\n}\n"
+            }
+        }
+    }
+
+    /// Honor a config `build-system` string.
+    pub fn from_config_value(v: &str) -> Option<BuildSystem> {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "plain" | "auto" => Some(BuildSystem::Plain),
+            "cargo" | "rust" => Some(BuildSystem::Cargo),
+            "meson" => Some(BuildSystem::Meson),
+            "cmake" => Some(BuildSystem::Cmake),
+            "zig" => Some(BuildSystem::Zig),
+            _ => None,
+        }
+    }
+}
+
+/// Detect the build system from a source archive's top-level contents. Uses
+/// `tar` to list the archive (cheap: metadata only, no extraction) and looks
+/// for the well-known build-system markers in any order.
+pub fn detect_build_system(archive_path: &Path) -> anyhow::Result<BuildSystem> {
+    let mut cmd = Command::new("tar");
+    cmd.arg("-tzf").arg(archive_path);
+    let output = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("tar failed: {e}"))?;
     if !output.status.success() {
-        return Ok(false);
+        return Ok(BuildSystem::Plain);
     }
     let listing = String::from_utf8_lossy(&output.stdout);
-    Ok(listing
-        .lines()
-        .any(|line| line.ends_with("/Cargo.toml") || line == "Cargo.toml"))
+
+    let has = |needle: &str| listing.lines().any(|l| l.ends_with(needle));
+    // Cargo's belt-and-suspenders: some crates only ship a `Cargo.toml` at the
+    // top level, some in a `src/` subdir.
+    if has("Cargo.toml") || has("Cargo.lock") {
+        return Ok(BuildSystem::Cargo);
+    }
+    if has("meson.build") {
+        return Ok(BuildSystem::Meson);
+    }
+    if has("CMakeLists.txt") {
+        return Ok(BuildSystem::Cmake);
+    }
+    if has("build.zig") || has("build.zig.zon") {
+        return Ok(BuildSystem::Zig);
+    }
+    Ok(BuildSystem::Plain)
 }
 
 /// Hash the archive with the current Gentoo policy (SHA256 + SHA512).
@@ -645,17 +727,29 @@ fn derive_category(project: &ProjectConfig, _upstream: &UpstreamConfig) -> anyho
     Ok("app-misc".to_string())
 }
 
-/// Render the ebuild text from metadata.
+/// Render the ebuild text from metadata, choosing the eclass and phase
+/// functions from the detected (or configured) build system.
 fn render_ebuild(
     pkg: PackageName,
     version: &str,
     project: &ProjectConfig,
-    _package_name: &str,
+    package_name: &str,
     srcurl: &str,
     s_override: Option<&str>,
-    is_cargo: bool,
+    build_system: BuildSystem,
 ) -> String {
     let p = project.package.as_ref();
+
+    // Effective eclass: an explicit `inherit` wins, then generic presets.
+    let inherit = p
+        .and_then(|x| x.inherit.clone())
+        .or_else(|| build_system.inherit().map(str::to_string));
+
+    // Effective phase bodies: custom `src-functions` win over the preset.
+    let src_functions = p
+        .and_then(|x| x.src_functions.clone())
+        .unwrap_or_else(|| build_system.src_functions().to_string());
+
     let meta = EbuildMetadata {
         eapi: Some("8".to_string()),
         description: p
@@ -683,8 +777,8 @@ fn render_ebuild(
     out.push_str("# Copyright 1999-2026 Gentoo Authors\n");
     out.push_str("# Distributed under the terms of the GNU General Public License v2\n\n");
     out.push_str(&format!("EAPI={}\n\n", meta.eapi.as_deref().unwrap_or("8")));
-    if is_cargo {
-        out.push_str("inherit cargo\n\n");
+    if let Some(inh) = &inherit {
+        out.push_str(&format!("inherit {inh}\n\n"));
     }
     if let Some(d) = &meta.description {
         push_var(&mut out, "DESCRIPTION", d);
@@ -712,7 +806,7 @@ fn render_ebuild(
         push_var(&mut out, "IUSE", i);
     }
     out.push('\n');
-    if is_cargo && meta.depend.is_none() {
+    if build_system == BuildSystem::Cargo && meta.depend.is_none() {
         out.push_str("DEPEND=\"dev-lang/rust:=\"\n\n");
     } else {
         if let Some(d) = &meta.depend {
@@ -725,13 +819,15 @@ fn render_ebuild(
     if let Some(b) = &meta.bdepend {
         push_var(&mut out, "BDEPEND", b);
     }
-    out.push('\n');
-    if !is_cargo {
-        out.push_str("src_install() {\n\tdefault\n}\n");
+    if let Some(r) = &p.and_then(|x| x.restrict.clone()) {
+        push_var(&mut out, "RESTRICT", r);
     }
+    out.push('\n');
+    out.push_str(&src_functions);
     // Keep the version referenced so it's used in the signature even if the
     // caller passes an empty version (avoids dead-code warnings in tests).
     let _ = version;
+    let _ = package_name;
     out
 }
 
@@ -1257,7 +1353,7 @@ mod tests {
             "foo",
             "https://github.com/foo/foo/releases/download/${PV}/${P}.tar.gz",
             None,
-            false,
+            BuildSystem::Plain,
         );
         assert!(content.contains("EAPI=8"));
         assert!(content.contains("DESCRIPTION="));
@@ -1283,7 +1379,7 @@ mod tests {
             "foo",
             "https://example.com/download/deps-${PV}.tar.gz",
             Some("${WORKDIR}/deps-${PV}"),
-            false,
+            BuildSystem::Plain,
         );
         assert!(content.contains("S=\"${WORKDIR}/deps-${PV}\""));
     }
@@ -1298,7 +1394,7 @@ mod tests {
             "ripgrep",
             "https://github.com/BurntSushi/ripgrep/releases/download/${PV}/${P}.tar.gz",
             None,
-            true,
+            BuildSystem::Cargo,
         );
         assert!(
             content.contains("inherit cargo"),
@@ -1309,8 +1405,8 @@ mod tests {
             "cargo ebuild should depend on rust"
         );
         assert!(
-            !content.lines().any(|l| l.starts_with("src_install")),
-            "cargo ebuild should not have custom src_install"
+            content.contains("src_install()"),
+            "cargo ebuild should carry the default src_install preset"
         );
     }
 
@@ -1534,7 +1630,7 @@ src_install() {
             "foo",
             "https://example.com/download/${PV}/foo-${PV}.tar.gz",
             None,
-            false,
+            BuildSystem::Plain,
         );
         let merged = render_diff_bump(old, &fresh);
 
@@ -1580,7 +1676,7 @@ src_compile() {
             "foo",
             "https://example.com/${PV}/source.tar.gz",
             Some("${WORKDIR}/source"),
-            false,
+            BuildSystem::Plain,
         );
         let merged = render_diff_bump(old, &fresh);
 
@@ -1630,5 +1726,100 @@ src_compile() {
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|(v, _)| v == "1.0.0"));
         assert!(found.iter().any(|(v, _)| v == "1.1.0"));
+    }
+
+    #[test]
+    fn render_ebuild_meson_inherit() {
+        let project = ProjectConfig::default();
+        let content = render_ebuild(
+            PackageName::new("foo").unwrap(),
+            "1.0.0",
+            &project,
+            "foo",
+            "https://example.com/download/${PV}/foo-${PV}.tar.gz",
+            None,
+            BuildSystem::Meson,
+        );
+        assert!(content.contains("inherit meson"));
+        assert!(content.contains("src_install()"));
+    }
+
+    #[test]
+    fn render_ebuild_cmake_inherit() {
+        let project = ProjectConfig::default();
+        let content = render_ebuild(
+            PackageName::new("foo").unwrap(),
+            "1.0.0",
+            &project,
+            "foo",
+            "https://example.com/${PV}/foo-${PV}.tar.gz",
+            None,
+            BuildSystem::Cmake,
+        );
+        assert!(content.contains("inherit cmake"));
+    }
+
+    #[test]
+    fn render_ebuild_zig_wires_phase_functions() {
+        let project = ProjectConfig::default();
+        let content = render_ebuild(
+            PackageName::new("foo").unwrap(),
+            "1.0.0",
+            &project,
+            "foo",
+            "https://example.com/${PV}/foo-${PV}.tar.gz",
+            None,
+            BuildSystem::Zig,
+        );
+        assert!(content.contains("inherit zig"));
+        assert!(content.contains("zig_src_configure"));
+        assert!(content.contains("zig_src_compile"));
+        assert!(content.contains("zig_src_install"));
+    }
+
+    #[test]
+    fn render_ebuild_zig_config_overrides() {
+        let project = ProjectConfig {
+            package: Some(crate::config::PackageConfig {
+                inherit: Some("zig xdg".to_string()),
+                src_functions: Some("src_configure() {\n\tzig_src_configure\n}\n".to_string()),
+                restrict: Some("test".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let content = render_ebuild(
+            PackageName::new("foo").unwrap(),
+            "1.0.0",
+            &project,
+            "foo",
+            "https://example.com/${PV}/foo-${PV}.tar.gz",
+            None,
+            BuildSystem::Plain, // ignored; config inherit wins
+        );
+        assert!(content.contains("inherit zig xdg"));
+        assert!(content.contains("zig_src_configure"));
+        assert!(content.contains("RESTRICT=\"test\""));
+        assert!(
+            !content.contains("src_install()"),
+            "custom src-functions replace the plain preset"
+        );
+    }
+
+    #[test]
+    fn build_system_config_values() {
+        assert_eq!(
+            BuildSystem::from_config_value("meson"),
+            Some(BuildSystem::Meson)
+        );
+        assert_eq!(
+            BuildSystem::from_config_value("zig"),
+            Some(BuildSystem::Zig)
+        );
+        assert_eq!(
+            BuildSystem::from_config_value("plain"),
+            Some(BuildSystem::Plain)
+        );
+        assert_eq!(BuildSystem::from_config_value("bogus"), None);
     }
 }

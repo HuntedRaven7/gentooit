@@ -45,6 +45,7 @@ gentooit mirrors the packit workflow set for Gentoo:
 | `gentooit propose-downstream` | `packit propose-downstream` | Take the latest (or pinned) upstream release, derive the source archive, build the ebuild + `Manifest` + `metadata.xml`, clone the downstream overlay, create a branch, commit, and open a PR. |
 | `gentooit build`            | `packit build`           | Run `pkgcheck scan` (QA) and/or `emerge` build an ebuild in the downstream check-out. Also emits a GitHub Actions workflow that builds in a `gentoo/stage3` container. |
 | `gentooit sync-from-downstream` | `packit sync-from-downstream` | Copy packaging files from the downstream ebuild repository back into the upstream project via a PR. |
+| `gentooit adopt`           | *none*               | Import an existing Gentoo package (ebuild + Manifest + metadata.xml + `files/`) from a portage tree into the overlay and pin it with a `.gentooit/<pkg>.yaml`. For ebuilds gentooit cannot synthesize (e.g. `zig` eclass, bundled deps, patch sets). |
 | `gentooit init`             | `packit init`            | Scaffold a `.gentooit.yaml` project config. |
 
 ## Installation
@@ -107,6 +108,28 @@ app-misc/ripgrep/metadata.xml           # maintainer, bugs-to, remote-id
 
 The `Manifest` hashes are generated with the current Gentoo policy (`SHA256` +
 `SHA512`), so the ebuild is immediately buildable and passes `pkgcheck`.
+
+## Importing existing packages (`adopt`)
+
+Some packages ship ebuilds that gentooit cannot synthesize — complex eclass
+wiring (e.g. `inherit zig`), bundled dependencies, or patch sets. For those,
+`adopt` imports the already-maintained Gentoo package as-is and pins it, so the
+rest of the workflow (verify-sources, diff-bumps, QA) keeps working:
+
+```sh
+# Copies app/... from the local portage tree into ebuilds/<category>/<pkg>,
+# plus Manifest, metadata.xml, and files/ patches.
+gentooit adopt --atom x11-terms/ghostty --tree /var/db/repos/gentoo
+
+# Import and pin a single version (default: all versions, newest pinned).
+gentooit adopt --atom x11-terms/ghostty --version 1.3.1
+```
+
+`adopt` writes `.gentooit/<pkg>.yaml` next to the package, deriving the
+upstream `archive-template`, `version` pin, and metadata from the imported
+`SRC_URI`/`metadata.xml`. Running from inside a repo with a `.gentooit.yaml`
+places the package under the configured downstream `package-dir` (e.g. an
+`ebuilds/` tree) and reuses the package defaults.
 
 ## Deploying the service (hands-off automation)
 
@@ -223,7 +246,7 @@ Top-level keys:
 | Key | Type | Meaning |
 | --- | ---- | ------- |
 | `upstream` | map | `vcs` (`github`/`gitlab`), `upstream` (`owner/repo`), `package_name` (PN), `tag_template`, `archive_template`, `archive_name`, `version` (pin). |
-| `package` | map | Static ebuild data gentooit can't infer: `description`, `homepage`, `license`, `slot`, `keywords`, `iuse`, `depend`, `rdepend`, `bdepend`, `maintainer_email`, `maintainer_name`, `remote_id_type`. |
+| `package` | map | Static ebuild data gentooit can't infer: `description`, `homepage`, `license`, `slot`, `keywords`, `iuse`, `depend`, `rdepend`, `bdepend`, `maintainer_email`, `maintainer_name`, `remote_id_type`. Build-system knobs: `build_system` (`plain`/`cargo`/`meson`/`cmake`/`zig`; default: auto-detected from the archive), `inherit` (override the eclass `inherit` line), `restrict` (emit `RESTRICT="..."`), `src_functions` (raw `src_*` function bodies, replacing the build-system preset). |
 | `downstream` | list | Target overlay(s): `url`, `branch`, `category`, `package_dir`. `url` may be a `git@…`/`https://github.com/…` remote or a local path. |
 | `files_to_sync` | list | `src`/`dest`/`delete` entries for `sync-from-downstream` (packit-style). |
 | `open_pull_request` | bool | Open a PR (default true) or just commit/push locally. |
@@ -243,7 +266,8 @@ gentooit/
 │   │   ├── metadata.rs    # metadata.xml parsing/rendering (GLEP 68, remote-id)
 │   │   ├── repo.rs        # git2-based repository operations (clone/branch/commit/push)
 │   │   ├── github.rs      # octocrab GitHub API client (releases, PRs, app auth)
-│   │   ├── propose.rs     # propose-downstream workflow
+│   │   ├── propose.rs     # propose-downstream workflow (build-system-aware ebuild rendering)
+│   │   ├── adopt.rs       # import existing Gentoo packages + .gentooit/<pkg>.yaml config derivation
 │   │   ├── build.rs       # build/QA workflow (pkgcheck, emerge, CI workflow template)
 │   │   └── sync.rs        # sync-from-downstream workflow
 │   └── gentooit-service/  # GitHub App webhook service (axum)

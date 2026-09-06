@@ -16,6 +16,7 @@ your own overlay** and **contributing back to gentooit itself**.
   - [Running the workflows](#running-the-workflows)
   - [What gets generated](#what-gets-generated)
   - [Rust / cargo packages](#rust--cargo-packages)
+  - [Non-cargo projects](#non-cargo-projects)
   - [Overlay layout tips](#overlay-layout-tips)
 - [Contributing to gentooit](#contributing-to-gentooit)
   - [Development setup](#development-setup)
@@ -130,7 +131,11 @@ open_pull_request: true                             # set false to commit/push o
 | `downstream[].url` | Your overlay repo URL. Supports SSH (`git@github.com:...`), HTTPS, or a local absolute path |
 | `downstream[].category` | Gentoo category (e.g. `app-misc`, `dev-lang`, `sys-apps`) |
 | `downstream[].package_dir` | Optional subdirectory inside the overlay (e.g. `ebuilds` for repos that nest packages) |
-| `package.depend` / `rdepend` / `bdepend` | Pre-fill dependency variables. Leave empty and gentooit will infer sensible defaults for Rust/cargo packages |
+| `package.depend` / `rdepend` / `bdepend` | Pre-fill dependency variables. Leave empty and gentooit will infer sensible defaults per build system |
+| `package.build_system` | Force a build system: `plain`, `cargo`, `meson`, `cmake`, `zig`. Default: auto-detected from the source archive. |
+| `package.inherit` | Override the eclass `inherit` line entirely (e.g. `"zig xdg"`). |
+| `package.restrict` | Emit `RESTRICT="..."` (e.g. `"test"`). |
+| `package.src_functions` | Raw `src_*` function bodies. Overrides the build-system preset (`src_install(){ default }`, or the `zig_src_*` chain for `zig`). |
 | `package.keywords` | Default `~amd64`. Set `"-*"` for ~arch keywording, or `"amd64"` for stable |
 
 ### User config (`~/.config/gentooit/config.yaml`)
@@ -174,15 +179,39 @@ Useful flags:
 
 #### `gentooit build`
 
-Run QA checks or a full emerge build against a local package directory:
+Run QA checks or a full emerge build against a package in the checkout:
 
 ```sh
 # QA only (pkgcheck scan):
-gentooit build --mode check --package-dir /path/to/overlay/app-misc/ripgrep
+gentooit build --check
 
 # Full emerge build:
-gentooit build --mode build --package-dir /path/to/overlay/app-misc/ripgrep
+gentooit build
+
+# Target a specific package (useful for multi-package overlays):
+gentooit build --check --atom x11-terms/ghostty
 ```
+
+`--atom` takes a `<category>/<package>` selection; without it, gentooit builds
+the first package it finds under `<package-dir>` (or `<category>/<package>`
+directories).
+
+#### `gentooit adopt`
+
+Import an existing Gentoo package (ebuild, `Manifest`, `metadata.xml`, and any
+`files/` patches) from a portage tree, for packages gentooit cannot synthesize
+(complex eclass wiring, bundled deps, patch sets):
+
+```sh
+gentooit adopt --atom x11-terms/ghostty
+gentooit adopt --atom x11-terms/ghostty --version 1.3.1 --tree /var/db/repos/gentoo
+```
+
+`adopt` writes `.gentooit/<pkg>.yaml` next to the copied package — pinning the
+version and deriving `archive-template` from the imported `SRC_URI` — so the
+package still participates in verify-sources, diff-bumps, and QA. Run it from
+inside a `.gentooit.yaml` project to inherit the downstream `package-dir`
+nesting and package maintainer defaults.
 
 #### `gentooit sync-from-downstream`
 
@@ -217,8 +246,10 @@ app-misc/ripgrep/metadata.xml           # maintainer, bugs-to, remote-id (GLEP 6
 
 The generated ebuild:
 
-- Inherits the **cargo** eclass automatically when the source archive contains a
-  `Cargo.toml`
+- Detects the **build system** from the source archive (`Cargo.toml` →
+  `inherit cargo`, `meson.build` → meson, `CMakeLists.txt` → cmake,
+  `build.zig`/`build.zig.zon` → zig, otherwise a plain `src_install` preset),
+  overridable with `package.build_system` / `package.inherit`
 - Adds `DEPEND="dev-lang/rust:="` for cargo projects so the Rust toolchain is
   available at build time
 - Detects non-standard source directories and sets `S` accordingly
@@ -236,8 +267,6 @@ source archive. When detected:
 - `inherit cargo` is added to the ebuild
 - `DEPEND="dev-lang/rust:="` is injected (only when you haven't explicitly set
   `DEPEND` in `.gentooit.yaml`)
-- The empty `src_install()` block is omitted because the cargo eclass handles
-  installation automatically
 
 If your project uses a workspace or has non-standard layout, set `package.depend`
 in `.gentooit.yaml` to fine-tune:
@@ -246,6 +275,22 @@ in `.gentooit.yaml` to fine-tune:
 package:
   depend: "dev-lang/rust:="
 ```
+
+### Non-cargo projects
+
+Set `package.build_system` (or let gentooit auto-detect) to pull the right
+eclass:
+
+```yaml
+package:
+  build_system: meson        # cargo | meson | cmake | zig | plain
+  inherit: "zig xdg"         # optional: override the inherit line entirely
+  restrict: test             # optional: emit RESTRICT="..."
+```
+
+For ebuilds too complex for the generator to express — `zig` eclass wiring,
+bundled-distfile manifests, custom patch sets — use `gentooit adopt` to import
+the maintained Gentoo package verbatim instead.
 
 ### Overlay layout tips
 

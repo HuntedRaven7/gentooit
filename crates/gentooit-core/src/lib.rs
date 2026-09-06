@@ -9,6 +9,7 @@
 //! provides the CLI and `gentooit-service` provides the GitHub App/service that
 //! automates these workflows.
 
+pub mod adopt;
 pub mod build;
 pub mod config;
 pub mod ebuild;

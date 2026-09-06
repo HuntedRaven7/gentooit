@@ -91,14 +91,41 @@ pub fn build(
     project: &ProjectConfig,
     mode: BuildMode,
     workdir: &Path,
+    atom: Option<&str>,
 ) -> Result<BuildReport, BuildError> {
-    let _ = project;
-    // Resolve the package directory. For v1 we assume the ebuilds live at
-    // `<workdir>/<category>/<package>`.
-    let pkg_dir = find_package_dir(workdir).ok_or_else(|| BuildError::CommandFailed {
+    // The overlay tree may be nested under a `package-dir` (e.g. `ebuilds/`).
+    let prefix = project
+        .downstream
+        .first()
+        .and_then(|d| d.package_dir.clone())
+        .unwrap_or_default();
+    let prefix = prefix.trim_matches('/');
+
+    let pkg_dir = match atom {
+        Some(a) => {
+            // Explicit `<category>/<package>` selection.
+            let rel = format!("{prefix}/{a}");
+            let p = workdir.join(&rel);
+            if p.is_dir() {
+                Some(p)
+            } else {
+                None
+            }
+        }
+        None => find_package_dir(workdir, prefix),
+    };
+    let pkg_dir = pkg_dir.ok_or_else(|| BuildError::CommandFailed {
         cmd: "locate package".to_string(),
         status: 1,
-        output: "could not locate the package directory to build".to_string(),
+        output: format!(
+            "could not locate a package directory under `{}/{}`",
+            workdir.display(),
+            if prefix.is_empty() {
+                "<category>/<package>"
+            } else {
+                prefix
+            }
+        ),
     })?;
 
     match mode {
@@ -115,51 +142,57 @@ pub fn build(
     }
 }
 
-/// Locate a package directory under `workdir` matching `<category>/<package>`.
-fn find_package_dir(workdir: &Path) -> Option<PathBuf> {
-    let mut found = None;
-    if let Ok(entries) = std::fs::read_dir(workdir) {
-        for cat in entries.flatten() {
-            if !cat.path().is_dir() {
-                continue;
-            }
-            if let Ok(pkgs) = std::fs::read_dir(cat.path()) {
-                for pkg in pkgs.flatten() {
-                    if pkg.path().is_dir() {
-                        found = Some(pkg.path());
-                        // Take the first found; refine if multiple.
-                        break;
+/// Locate a package directory under `workdir`, preferring the repo's
+/// `package-dir` prefix, matching `<category>/<package>`.
+fn find_package_dir(workdir: &Path, prefix: &str) -> Option<PathBuf> {
+    let roots: Vec<PathBuf> = if prefix.is_empty() {
+        vec![workdir.to_path_buf()]
+    } else {
+        vec![workdir.to_path_buf(), workdir.join(prefix)]
+    };
+
+    for root in &roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for cat in entries.flatten() {
+                if !cat.path().is_dir() {
+                    continue;
+                }
+                if let Ok(pkgs) = std::fs::read_dir(cat.path()) {
+                    for pkg in pkgs.flatten() {
+                        if pkg.path().is_dir() {
+                            return Some(pkg.path());
+                        }
                     }
                 }
             }
-            if found.is_some() {
-                break;
-            }
         }
     }
-    found
+    None
 }
 
-/// Find the first ebuild in a package directory and derive its atom.
+/// Find the first ebuild in a package directory and derive its atom
+/// (`<category>/<package>`, without the ebuild filename).
 fn find_ebuild_atom(pkg_dir: &Path) -> Result<String, BuildError> {
     let entries = std::fs::read_dir(pkg_dir).map_err(|e| BuildError::CommandFailed {
         cmd: "readdir".to_string(),
         status: 1,
         output: e.to_string(),
     })?;
-    let mut ebuild = None;
+    let mut has_ebuild = false;
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if name.ends_with(".ebuild") {
-            ebuild = Some(name);
+            has_ebuild = true;
             break;
         }
     }
-    let ebuild = ebuild.ok_or_else(|| BuildError::CommandFailed {
-        cmd: "find ebuild".to_string(),
-        status: 1,
-        output: format!("no ebuild in {}", pkg_dir.display()),
-    })?;
+    if !has_ebuild {
+        return Err(BuildError::CommandFailed {
+            cmd: "find ebuild".to_string(),
+            status: 1,
+            output: format!("no ebuild in {}", pkg_dir.display()),
+        });
+    }
     let category = pkg_dir
         .parent()
         .and_then(Path::file_name)
@@ -169,7 +202,7 @@ fn find_ebuild_atom(pkg_dir: &Path) -> Result<String, BuildError> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("package");
-    Ok(format!("{category}/{package}/{ebuild}"))
+    Ok(format!("{category}/{package}"))
 }
 
 fn run_tool(tool: &str, args: &[&str], cwd: &Path) -> Result<BuildReport, BuildError> {

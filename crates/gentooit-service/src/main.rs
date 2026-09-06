@@ -279,7 +279,7 @@ async fn run_build(
         None => ProjectConfig::default(),
     };
 
-    let report = build(&project, BuildMode::Check, workdir.path());
+    let report = build(&project, BuildMode::Check, workdir.path(), None);
 
     let report = match report {
         Ok(r) => r,

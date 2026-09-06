@@ -1,6 +1,6 @@
 [package]
 name = "gentooit-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Core library for gentooit - packit-like automation for Gentoo Linux"
 license = "MIT"

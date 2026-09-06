@@ -4,6 +4,8 @@
 //! * `propose-downstream` — take an upstream release and open a PR updating
 //!   (or creating) the Gentoo ebuild in a downstream overlay.
 //! * `build` — build/test an ebuild (QA checks or full emerge build).
+//! * `adopt` — import an existing Gentoo package (folded into the overlay and
+//!   pinned with a `.gentooit/<pkg>.yaml`) when gentooit cannot synthesize it.
 //! * `sync-from-downstream` — copy downstream ebuild files back into the
 //!   upstream project via a PR.
 //! * `init` — scaffold a `.gentooit.yaml` project config.
@@ -11,6 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use gentooit_core::adopt;
 use gentooit_core::build::{self, BuildMode};
 use gentooit_core::config::{config_dir, ProjectConfig, UserConfig};
 use gentooit_core::propose;
@@ -69,6 +72,23 @@ enum Command {
         /// Only run QA checks (pkgcheck), don't do a full build.
         #[arg(long)]
         check: bool,
+        /// The package to build, as `<category>/<package>` (default: first found).
+        #[arg(long)]
+        atom: Option<String>,
+    },
+
+    /// Import an existing package (ebuild, Manifest, metadata.xml, files/)
+    /// from a Gentoo tree into this overlay, pinning it with a .gentooit config.
+    Adopt {
+        /// The package to adopt, as `<category>/<package>`.
+        #[arg(long)]
+        atom: String,
+        /// Path to a Gentoo tree (default: /var/db/repos/gentoo).
+        #[arg(long)]
+        tree: Option<PathBuf>,
+        /// Import and pin a single version (default: all versions, newest pinned).
+        #[arg(long)]
+        version: Option<String>,
     },
 
     /// Copy downstream ebuild files back into the upstream repo via a PR.
@@ -114,7 +134,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 run_propose(&project, &user, cli.workdir.as_deref(), force, no_qa).await
             }
         }
-        Command::Build { check } => {
+        Command::Build { check, atom } => {
             let project = load_project(cli.config.as_deref())?;
             let mode = if check {
                 BuildMode::Check
@@ -122,7 +142,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 BuildMode::Build
             };
             let workdir = resolve_workdir(cli.workdir.as_deref());
-            match build::build(&project, mode, &workdir) {
+            match build::build(&project, mode, &workdir, atom.as_deref()) {
                 Ok(report) => {
                     print_report(&report);
                     if report.success {
@@ -133,6 +153,43 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 Err(e) => Err(e.into()),
             }
+        }
+        Command::Adopt {
+            atom,
+            tree,
+            version,
+        } => {
+            // `init` config is optional for adopt; without one, defaults place
+            // the package directly under the working directory.
+            let project = load_project(cli.config.as_deref()).ok();
+            let tree = tree.unwrap_or_else(|| PathBuf::from("/var/db/repos/gentoo"));
+            let workdir = resolve_workdir(cli.workdir.as_deref());
+            let report =
+                adopt::adopt_package(&atom, version.as_deref(), &tree, &workdir, project.as_ref())?;
+            println!(
+                "Adopted {}{}",
+                report.atom,
+                report
+                    .version
+                    .as_ref()
+                    .map(|v| format!(" (pinned {v})"))
+                    .unwrap_or_default()
+            );
+            println!("  ebuilds: {}", report.ebuilds.join(", "));
+            for extra in &report.extra_files {
+                println!("  files: {extra}");
+            }
+            println!("  into: {}", report.destination.display());
+            if let Some(cfg) = &report.config_path {
+                println!("  config: {}", cfg.display());
+                println!(
+                    "  hint: review {} before running `gentooit propose-downstream`",
+                    cfg.display()
+                );
+            } else {
+                println!("  config: already exists, left untouched");
+            }
+            Ok(())
         }
         Command::SyncFromDownstream { local } => {
             let project = load_project(cli.config.as_deref())?;
